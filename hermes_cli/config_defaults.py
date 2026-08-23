@@ -881,12 +881,11 @@ DEFAULT_CONFIG = {
         "codex_gpt55_autoraise": True,  # Historical key name kept for compatibility.
                                       # When True, gpt-5.4 / gpt-5.5 / gpt-5.6 on the
                                       # ChatGPT Codex OAuth route raise their compaction
-                                      # trigger to 85% (vs the global `threshold` above).
-                                      # Codex hard-caps these families at a 272K window, so
-                                      # the default 50% would compact at ~136K and waste half
-                                      # the usable context. Set to False to opt back down to
-                                      # the global threshold (e.g. 0.50) for those Codex
-                                      # sessions. Only this exact route is affected —
+                                      # trigger to 85% (vs the global `threshold` above) only
+                                      # when their effective context resolves below 512K.
+                                      # Large configured/resolved windows keep the global
+                                      # threshold. Set to False to disable the small-window
+                                      # raise. Only this exact route is affected —
                                       # gpt-5.4 / 5.5 / 5.6 on OpenAI's direct API,
                                       # OpenRouter, and Copilot keep the global threshold
                                       # regardless.

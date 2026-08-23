@@ -82,7 +82,11 @@ class TestGpt56CodexCompaction:
             "gpt-5.6-luna-pro",
         ):
             assert (
-                _compression_threshold_for_model(slug, provider="openai-codex")
+                _compression_threshold_for_model(
+                    slug,
+                    provider="openai-codex",
+                    effective_context_length=272_000,
+                )
                 == 0.85
             ), slug
 

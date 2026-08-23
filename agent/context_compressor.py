@@ -2055,15 +2055,24 @@ def resolve_model_threshold(
     This is a module-level helper so plugin context engines (e.g. LCM) can
     import and reuse the same resolution logic as the built-in compressor.
     """
+    override = resolve_model_threshold_override(model, model_thresholds)
+    return default if override is None else override
+
+
+def resolve_model_threshold_override(
+    model: str,
+    model_thresholds: dict[str, float] | None,
+) -> float | None:
+    """Return the longest matching explicit per-model override, if any."""
     if not model_thresholds or not model:
-        return default
+        return None
     best_key = ""
     for key in model_thresholds:
         if key in model and len(key) > len(best_key):
             best_key = key
     if best_key:
         return float(model_thresholds[best_key])
-    return default
+    return None
 
 
 class ContextCompressor(ContextEngine):
@@ -2252,6 +2261,11 @@ class ContextCompressor(ContextEngine):
                 config_context_length=self._config_context_length,
                 provider=self.provider,
             )
+            self._base_threshold_percent = self._runtime_base_threshold_percent(
+                self.model,
+                self.provider,
+                self._resolved_context_length,
+            )
             # Small-context threshold floor: models under 512K trigger at
             # >=75% so compaction doesn't fire with half the window still
             # free. Raise-only; must run AFTER context_length is resolved
@@ -2287,8 +2301,13 @@ class ContextCompressor(ContextEngine):
         # __init__ (no _base_threshold_percent).
         _base = getattr(self, "_base_threshold_percent", None)
         if _base is not None:
+            self._base_threshold_percent = self._runtime_base_threshold_percent(
+                self.model,
+                self.provider,
+                value,
+            )
             self.threshold_percent = self._effective_threshold_percent(
-                value, _base,
+                value, self._base_threshold_percent,
             )
         self._threshold_tokens = None
         self._tail_token_budget = None
@@ -2833,6 +2852,56 @@ class ContextCompressor(ContextEngine):
         except Exception as exc:
             logger.debug("compression failure cooldown clear failed (non-sqlite): %s", exc)
 
+    def _runtime_base_threshold_percent(
+        self,
+        model: str,
+        provider: str,
+        context_length: int,
+    ) -> float:
+        """Resolve host policy only after the effective window is known.
+
+        Explicit ``compression.model_thresholds`` entries win. Otherwise the
+        model/route policy is recomputed from the configured global threshold
+        and effective context, so switches cannot retain a stale Codex raise.
+        """
+        configured = getattr(
+            self, "_config_threshold_percent", self.threshold_percent,
+        )
+        explicit = resolve_model_threshold_override(model, self.model_thresholds)
+        if explicit is not None:
+            self._threshold_autoraise_notice = None
+            return explicit
+
+        from agent.auxiliary_client import (
+            _compression_threshold_for_model,
+            _is_codex_gpt54_or_gpt55,
+            _is_codex_spark,
+        )
+
+        override = _compression_threshold_for_model(
+            model,
+            provider,
+            allow_codex_gpt55_autoraise=getattr(
+                self, "allow_codex_gpt55_autoraise", True,
+            ),
+            effective_context_length=context_length,
+        )
+        if override is None:
+            self._threshold_autoraise_notice = None
+            return configured
+        if _is_codex_gpt54_or_gpt55(model, provider) or _is_codex_spark(
+            model, provider,
+        ):
+            effective = max(configured, override)
+            self._threshold_autoraise_notice = (
+                {"model": model, "from": configured, "to": effective}
+                if effective > configured + 1e-9
+                else None
+            )
+            return effective
+        self._threshold_autoraise_notice = None
+        return override
+
     def update_model(
         self,
         model: str,
@@ -2857,14 +2926,13 @@ class ContextCompressor(ContextEngine):
         self.api_mode = api_mode
         self.context_length = context_length
         # Re-resolve per-model threshold for the NEW model, then re-apply the
-        # small-context threshold floor. Starting from _config_threshold_percent
-        # (the raw config value) so a switch from a model with an override to
-        # one without correctly falls back to the global threshold.
-        _config_pct = getattr(
-            self, "_config_threshold_percent", self.threshold_percent,
-        )
-        _new_base = resolve_model_threshold(
-            model, self.model_thresholds, _config_pct,
+        # small-context threshold floor. Runtime policy starts from the raw
+        # configured threshold, so switching away from an autoraised Codex
+        # route cannot retain the previous model's override.
+        _new_base = self._runtime_base_threshold_percent(
+            model,
+            provider,
+            context_length,
         )
         self._base_threshold_percent = _new_base
         self.threshold_percent = self._effective_threshold_percent(
@@ -3076,12 +3144,15 @@ class ContextCompressor(ContextEngine):
         proactive_prune_min_reclaim_tokens: int = 4096,
         min_tail_user_messages: int = 1,
         tail_mode: str = "legacy",
+        allow_codex_gpt55_autoraise: bool = True,
     ):
         self.model = model
         self.base_url = base_url
         self.api_key = api_key
         self.provider = provider
         self.api_mode = api_mode
+        self.allow_codex_gpt55_autoraise = allow_codex_gpt55_autoraise
+        self._threshold_autoraise_notice = None
         # Lean tail mode (#compaction-v2): "lean" = small clamped recency
         # tail + verbatim-user-message summary section + recovery pointers;
         # "legacy" = 0.20*window tail (shipping behavior).

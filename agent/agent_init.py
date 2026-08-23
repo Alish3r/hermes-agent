@@ -2073,13 +2073,13 @@ def init_agent(
     if not isinstance(_compression_cfg, dict):
         _compression_cfg = {}
     compression_threshold = float(_compression_cfg.get("threshold", 0.50))
-    # Per-model/route compaction-threshold override. Codex gpt-5.4 / gpt-5.5
-    # raise to 85% (the Codex backend caps both families at 272K, so the
-    # default 50% would compact at ~136K — half the usable context). Gated by
-    # an opt-out config flag so the user can fall back to the global threshold;
-    # when the override fires we stash a one-time notification (replayed on the
-    # first turn) that tells the user what changed and how to revert. The
-    # notice has its own display gate so users can keep the threshold
+    # Per-model/route compaction-threshold override. Codex gpt-5.4 / gpt-5.5 /
+    # gpt-5.6 raise to 85% only when the effective window resolves below 512K;
+    # large configured/provider-resolved windows keep the global threshold.
+    # Gated by an opt-out config flag so the user can fall back to the global
+    # threshold; when the override fires we stash a one-time notification
+    # (replayed on the first turn) that tells the user what changed and how to
+    # revert. The notice has its own display gate so users can keep the threshold
     # autoraise without getting the banner on gateway turns.
     _codex_gpt55_autoraise = str(
         _compression_cfg.get("codex_gpt55_autoraise", True)
@@ -2088,35 +2088,10 @@ def init_agent(
         _compression_cfg.get("codex_gpt55_autoraise_notice", True)
     ).lower() in {"true", "1", "yes"}
     agent._compression_threshold_autoraised = None
-    try:
-        from agent.auxiliary_client import (
-            _compression_threshold_for_model as _cthresh_fn,
-            _is_codex_gpt54_or_gpt55 as _is_codex_gpt54_or_gpt55_fn,
-            _is_codex_spark as _is_codex_spark_fn,
-        )
-        _model_cthresh = _cthresh_fn(
-            agent.model,
-            agent.provider,
-            allow_codex_gpt55_autoraise=_codex_gpt55_autoraise,
-        )
-        # The Codex autoraises (gpt-5.4/5.5 272K family and gpt-5.3-codex-spark)
-        # apply only when they RAISE (never lower a user's higher global
-        # threshold). The notice is populated only when it actually fires, and
-        # carries the model slug so the banner names the right family. Arcee
-        # Trinity keeps its long-standing unconditional behaviour.
-        compression_threshold, agent._compression_threshold_autoraised = (
-            _resolve_compression_threshold(
-                compression_threshold,
-                _model_cthresh,
-                model=agent.model,
-                is_codex_autoraise=(
-                    _is_codex_gpt54_or_gpt55_fn(agent.model, agent.provider)
-                    or _is_codex_spark_fn(agent.model, agent.provider)
-                ),
-            )
-        )
-    except Exception:
-        pass
+    # Model/route policy is resolved by the built-in compressor only after the
+    # effective context window is known. Applying it here used to turn 0.85
+    # into the compressor's configured base before a configured/resolved 900K
+    # window was available, and that stale value survived later switches.
     compression_enabled = str(_compression_cfg.get("enabled", True)).lower() in {"true", "1", "yes"}
     compression_target_ratio = float(_compression_cfg.get("target_ratio", 0.20))
     compression_protect_last = int(_compression_cfg.get("protect_last_n", 20))
@@ -2756,6 +2731,7 @@ def init_agent(
             proactive_prune_min_reclaim_tokens=compression_proactive_prune_min_reclaim,
             min_tail_user_messages=compression_min_tail_users,
             tail_mode=compression_tail_mode,
+            allow_codex_gpt55_autoraise=_codex_gpt55_autoraise,
         )
     _bind_session_state = getattr(agent.context_compressor, "bind_session_state", None)
     if callable(_bind_session_state):
@@ -2786,6 +2762,10 @@ def init_agent(
     # Reject models whose context window is below the minimum required
     # for reliable tool-calling workflows (64K tokens).
     _ctx = getattr(agent.context_compressor, "context_length", 0)
+    if _selected_engine is None:
+        agent._compression_threshold_autoraised = getattr(
+            agent.context_compressor, "_threshold_autoraise_notice", None,
+        )
     _allow_lmstudio_explicit_below_floor = (
         str(getattr(agent, "provider", "") or "").strip().lower() == "lmstudio"
         and isinstance(agent._config_context_length, int)
