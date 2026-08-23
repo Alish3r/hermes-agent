@@ -973,6 +973,7 @@ def _build_recovery_footer(session_id: str, region_len: int) -> str:
 # calls at compaction time only.
 _LEAN_DIGEST_CHUNK_CHARS = 72_000      # ~18K tokens of region per chunk
 _LEAN_DIGEST_MAX_CHUNKS = 28
+_LEAN_DIGEST_MAX_AUX_CALLS = 1         # prevent sequential LLM fan-out
 _LEAN_DIGEST_MAX_TOKENS = 1_400        # per-chunk digest cap (~13:1 ratio)
 _LEAN_DIGESTS_HEADING = "## Detailed Session Log (chunked digests, oldest first)"
 
@@ -4522,6 +4523,19 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         if n_chunks > _LEAN_DIGEST_MAX_CHUNKS:
             chunk_size = (len(text) + _LEAN_DIGEST_MAX_CHUNKS - 1) // _LEAN_DIGEST_MAX_CHUNKS
             n_chunks = _LEAN_DIGEST_MAX_CHUNKS
+        if n_chunks > _LEAN_DIGEST_MAX_AUX_CALLS:
+            # Chunk digests are optional recovery detail appended after the
+            # main checkpoint.  Sequentially calling the compression model up
+            # to 28 more times made tool-heavy sessions exceed the host's total
+            # ceiling after their main summary had already completed.  Keep the
+            # deterministic anchor/user/recovery sections and point to the
+            # archived transcript instead of turning one compaction into an
+            # unbounded auxiliary fan-out.
+            return (
+                "\n\n" + _LEAN_DIGESTS_HEADING + "\n"
+                f"[auxiliary digests omitted for {n_chunks} segments to keep "
+                "compaction bounded; recover exact details with session_search]"
+            )
         digests: list[str] = []
         for ci in range(n_chunks):
             segment = text[ci * chunk_size:(ci + 1) * chunk_size]

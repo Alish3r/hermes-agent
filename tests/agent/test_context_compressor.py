@@ -2886,6 +2886,72 @@ class TestDoubleCompactionSummaryRole:
         )
 
 
+class TestLeanDigestBudget:
+    def test_large_region_omits_auxiliary_digest_fanout(self, compressor):
+        """Large lean regions must not launch sequential optional LLM calls."""
+        compressor.tail_mode = "lean"
+        turns = [
+            {"role": "user", "content": "A" * 80_000},
+            {"role": "assistant", "content": "B" * 80_000},
+        ]
+
+        with patch("agent.auxiliary_client.call_llm") as mock_call:
+            digests = compressor._build_chunk_digests(turns)
+
+        mock_call.assert_not_called()
+        assert "auxiliary digests omitted" in digests
+        assert "session_search" in digests
+
+    def test_single_chunk_digest_keeps_existing_auxiliary_behavior(self, compressor):
+        compressor.tail_mode = "lean"
+        response = MagicMock()
+        response.choices = [MagicMock()]
+        response.choices[0].message.content = "- exact bounded digest"
+
+        with patch("agent.auxiliary_client.call_llm", return_value=response) as mock_call:
+            digests = compressor._build_chunk_digests(
+                [{"role": "user", "content": "small transcript"}]
+            )
+
+        mock_call.assert_called_once()
+        assert "exact bounded digest" in digests
+
+    def test_large_lean_compress_commits_main_summary_without_digest_fanout(
+        self, compressor
+    ):
+        compressor.tail_mode = "lean"
+        compressor.tail_token_budget = 100
+        compressor._session_id = "session-large-lean"
+        messages = [{"role": "system", "content": "system"}]
+        for i in range(20):
+            messages.extend(
+                [
+                    {"role": "user", "content": f"user-{i} " + ("U" * 8000)},
+                    {
+                        "role": "assistant",
+                        "content": f"assistant-{i} " + ("A" * 8000),
+                    },
+                ]
+            )
+        response = MagicMock()
+        response.choices = [MagicMock()]
+        response.choices[0].message.content = "main structured checkpoint"
+
+        with patch("agent.context_compressor.call_llm", return_value=response) as mock_call:
+            compressed = compressor.compress(
+                messages,
+                current_tokens=90_000,
+                force=True,
+            )
+
+        mock_call.assert_called_once()
+        assert len(compressed) < len(messages)
+        joined = "\n".join(str(m.get("content") or "") for m in compressed)
+        assert "main structured checkpoint" in joined
+        assert "auxiliary digests omitted" in joined
+        assert "session_search" in joined
+
+
 class TestSummaryPromptBounding:
 
 
