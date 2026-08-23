@@ -2456,6 +2456,8 @@ def connect(
                     # stale PRAGMA snapshots during gateway startup.
                     conn.executescript(SCHEMA_SQL)
                     _migrate_add_optional_columns(conn)
+                    from hermes_cli.epic_state import initialize_schema as _initialize_epic_state
+                    _initialize_epic_state(conn)
                     _INITIALIZED_PATHS.add(resolved)
         except Exception:
             conn.close()
@@ -10662,15 +10664,19 @@ def _resolve_worker_cli_toolsets(hermes_home: Optional[str]) -> Optional[list[st
     try:
         from hermes_constants import reset_hermes_home_override, set_hermes_home_override
         from hermes_cli.config import load_config
-        from hermes_cli.tools_config import _get_platform_tools
+        from hermes_cli.tools_config import (
+            _get_platform_tools,
+            has_exact_profile_toolset_pin,
+        )
 
         token = set_hermes_home_override(hermes_home)
         try:
             cfg = load_config()
+            exact_pin = has_exact_profile_toolset_pin(cfg)
             toolsets = sorted(_get_platform_tools(cfg, "cli"))
         finally:
             reset_hermes_home_override(token)
-        return toolsets or None
+        return toolsets if exact_pin else (toolsets or None)
     except Exception as exc:
         _log.debug(
             "kanban worker: could not resolve CLI toolsets for HERMES_HOME=%r (%s)",

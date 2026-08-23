@@ -16,7 +16,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
-from typing import Dict, List, Optional, Set
+from typing import Dict, Iterable, List, Optional, Set
 
 
 from hermes_cli.config import (
@@ -2400,14 +2400,135 @@ def _enable_recently_shipped_toolsets(
         enabled_toolsets.add(ts_key)
 
 
+def has_exact_profile_toolset_pin(config: dict) -> bool:
+    tools_cfg = config.get("tools")
+    return isinstance(tools_cfg, dict) and "enabled_toolsets" in tools_cfg
+
+
+def get_exact_profile_toolset_pin(config: dict) -> Optional[list[str]]:
+    if not has_exact_profile_toolset_pin(config):
+        return None
+    pinned = config["tools"].get("enabled_toolsets")
+    if not isinstance(pinned, list):
+        raise ValueError("tools.enabled_toolsets must be a list")
+    return [str(item).strip() for item in pinned if str(item).strip()]
+
+
+def set_exact_profile_toolset_pin(
+    config: dict,
+    enabled_toolsets: Optional[Iterable[str]],
+) -> None:
+    """Persist an exact profile pin, or remove it only when passed ``None``."""
+    tools_cfg = config.get("tools")
+    if not isinstance(tools_cfg, dict):
+        tools_cfg = {}
+        config["tools"] = tools_cfg
+    if enabled_toolsets is None:
+        tools_cfg.pop("enabled_toolsets", None)
+        return
+    from toolsets import is_wildcard_toolset, validate_toolset
+
+    names = sorted({str(item).strip() for item in enabled_toolsets if str(item).strip()})
+    wildcards = [name for name in names if is_wildcard_toolset(name)]
+    if wildcards:
+        raise ValueError(
+            "wildcard toolset(s) cannot be pinned (a pin is an exact allowlist): "
+            + ", ".join(wildcards)
+        )
+    unknown = [name for name in names if not validate_toolset(name)]
+    if unknown:
+        raise ValueError(
+            "unknown exact profile toolset(s): " + ", ".join(unknown)
+        )
+    tools_cfg["enabled_toolsets"] = names
+
+
 def _get_platform_tools(
     config: dict,
     platform: str,
     *,
     include_default_mcp_servers: bool = True,
 ) -> Set[str]:
-    """Resolve which individual toolset names are enabled for a platform."""
-    from toolsets import resolve_toolset, TOOLSETS
+    """Resolve which individual toolset names are enabled for a platform.
+
+    ``tools.enabled_toolsets`` is a profile-level exact capability pin. When
+    present it takes precedence over platform composites, default MCP recovery,
+    recently shipped toolsets, and platform-native recovery. This is required
+    for least-privilege profiles: a saved ``artifact_read`` pin must not grow
+    back into ``hermes-cli`` merely because the platform has broad defaults.
+
+    Unknown or malformed pins fail closed to an empty set rather than silently
+    dropping only the bad entry and widening the remainder.
+    """
+    from toolsets import (
+        is_wildcard_toolset,
+        resolve_toolset,
+        TOOLSETS,
+        validate_toolset,
+    )
+
+    if has_exact_profile_toolset_pin(config):
+        try:
+            names = get_exact_profile_toolset_pin(config) or []
+        except ValueError as exc:
+            logger.error("%s; failing closed with no tools", exc)
+            return set()
+        # ``validate_toolset`` accepts the ``all``/``*`` convenience aliases and
+        # ``resolve_toolset`` expands them to every tool in every toolset. A pin
+        # is an exact allowlist, so a wildcard is malformed input here — not a
+        # shorthand — and must fail closed like any other malformed pin.
+        wildcards = [name for name in names if is_wildcard_toolset(name)]
+        if wildcards:
+            logger.error(
+                "profile toolset pin contains wildcard toolset(s): %s; a pin is "
+                "an exact allowlist — failing closed with no tools",
+                ", ".join(sorted(wildcards)),
+            )
+            return set()
+        unknown = [name for name in names if not validate_toolset(name)]
+        if unknown:
+            logger.error(
+                "profile toolset pin contains unknown toolset(s): %s; "
+                "failing closed with no tools",
+                ", ".join(sorted(unknown)),
+            )
+            return set()
+        enabled = set(names)
+        # Every other branch of this function filters through
+        # ``_toolset_allowed_for_platform``. Without this the pin would be the
+        # only configuration path able to enable a platform-restricted toolset
+        # (e.g. ``discord_admin`` on telegram). Note this narrows only; the
+        # ``_DEFAULT_OFF_TOOLSETS`` subtraction is deliberately NOT applied,
+        # because that gate exists to keep opt-in toolsets out of *implicit*
+        # composite expansion — an explicit list keeps them (see the explicit
+        # branch below), and a pin is the most explicit configuration there is.
+        restricted = {
+            name for name in enabled
+            if not _toolset_allowed_for_platform(name, platform)
+        }
+        if restricted:
+            logger.warning(
+                "profile toolset pin drops toolset(s) not configurable on "
+                "platform %s: %s",
+                platform,
+                ", ".join(sorted(restricted)),
+            )
+            enabled -= restricted
+        if include_default_mcp_servers:
+            # Profile MCP entries are explicit profile configuration. Preserve
+            # enabled entries, but never recover servers from another profile.
+            enabled.update(enabled_mcp_server_names(config))
+        agent_cfg = config.get("agent") or {}
+        disabled_toolsets = agent_cfg.get("disabled_toolsets") or []
+        if disabled_toolsets:
+            from agent.skill_utils import parse_config_string_list
+
+            enabled -= {
+                name.strip()
+                for name in parse_config_string_list(disabled_toolsets)
+                if name.strip()
+            }
+        return enabled
 
     platform_toolsets = config.get("platform_toolsets") or {}
     toolset_names = platform_toolsets.get(platform)

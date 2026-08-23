@@ -11,6 +11,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
+import yaml
 
 import tui_gateway.server as srv
 
@@ -96,3 +97,33 @@ def test_two_concurrent_writers_cannot_both_replace_the_same_revision(home):
     loser = next(result for result in results if result["ui_meta"] is False)
     assert loser["ui_meta_conflicts"]["shared-room"]["actual"] == 1
     assert _default_profile()["ui_meta_revisions"]["shared-room"] == 1
+
+
+def test_profile_capability_rpc_persists_empty_pin_until_explicit_clear(home):
+    response = srv._methods["profiles.configure"](
+        "pin-empty",
+        {"name": "default", "enabled_toolsets": []},
+    )
+    assert response["result"]["applied"]["toolsets"] is True
+    config = yaml.safe_load((home / "config.yaml").read_text())
+    assert config["tools"]["enabled_toolsets"] == []
+
+    response = srv._methods["profiles.configure"](
+        "clear-pin",
+        {"name": "default", "clear_enabled_toolsets": True},
+    )
+    assert response["result"]["applied"]["toolsets"] is True
+    config = yaml.safe_load((home / "config.yaml").read_text())
+    assert "enabled_toolsets" not in config.get("tools", {})
+
+
+def test_profile_capability_rpc_rejects_unknown_exact_toolset(home):
+    response = srv._methods["profiles.configure"](
+        "bad-pin",
+        {"name": "default", "enabled_toolsets": ["not-a-toolset"]},
+    )
+    assert response["result"]["applied"]["toolsets"] is False
+    config_path = home / "config.yaml"
+    if config_path.exists():
+        config = yaml.safe_load(config_path.read_text()) or {}
+        assert "enabled_toolsets" not in config.get("tools", {})

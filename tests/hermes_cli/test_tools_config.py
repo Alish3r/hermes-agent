@@ -1219,3 +1219,85 @@ def test_explicit_plugin_toolset_admitted_against_real_a2a_plugin(monkeypatch):
         f"plugin-provided 'a2a' toolset dropped by _get_platform_tools "
         f"(Layer 2 of #81163); enabled={sorted(enabled)}"
     )
+
+
+# --- Exact profile toolset pin: least-privilege guards (Phase 0 review F1/F2) ---
+
+
+@pytest.mark.parametrize("wildcard", ["all", "*"])
+def test_exact_pin_fails_closed_on_wildcard_toolset(wildcard, caplog):
+    """A wildcard pin must fail closed instead of expanding to every toolset.
+
+    ``validate_toolset`` accepts ``all``/``*`` as convenience aliases and
+    ``resolve_toolset`` expands them to the union of every toolset. A pin is
+    documented and tested as an *exact* allowlist, so a one-token wildcard must
+    never be an accepted pin value.
+    """
+    config = {"tools": {"enabled_toolsets": [wildcard]}}
+
+    with caplog.at_level(logging.ERROR):
+        enabled = _get_platform_tools(config, "cli", include_default_mcp_servers=False)
+
+    assert enabled == set(), f"wildcard pin {wildcard!r} did not fail closed"
+    assert "wildcard" in caplog.text.lower()
+
+
+@pytest.mark.parametrize("wildcard", ["all", "*"])
+def test_exact_pin_wildcard_grants_no_shell_tools(wildcard):
+    """The security property behind the fail-closed rule: no capability leak."""
+    from toolsets import resolve_multiple_toolsets
+
+    config = {"tools": {"enabled_toolsets": [wildcard]}}
+    enabled = _get_platform_tools(config, "cli", include_default_mcp_servers=False)
+    resolved = set(resolve_multiple_toolsets(sorted(enabled)))
+
+    assert {"terminal", "process", "execute_code"}.isdisjoint(resolved), (
+        f"wildcard pin {wildcard!r} leaked shell/exec tools: "
+        f"{sorted({'terminal', 'process', 'execute_code'} & resolved)}"
+    )
+
+
+def test_set_exact_profile_toolset_pin_rejects_wildcard():
+    """The writer must refuse to persist a wildcard pin."""
+    from hermes_cli.tools_config import set_exact_profile_toolset_pin
+
+    config: dict = {}
+    with pytest.raises(ValueError, match="wildcard"):
+        set_exact_profile_toolset_pin(config, ["artifact_read", "*"])
+    assert "enabled_toolsets" not in config.get("tools", {})
+
+
+def test_exact_pin_honours_platform_toolset_restrictions(caplog):
+    """A pin must not reach a toolset that is restricted away from the platform.
+
+    Every other branch of ``_get_platform_tools`` filters through
+    ``_toolset_allowed_for_platform``; the pin branch must too, or a pin becomes
+    the only configuration path that can enable ``discord_admin`` off Discord.
+    """
+    config = {"tools": {"enabled_toolsets": ["artifact_read", "discord_admin"]}}
+
+    with caplog.at_level(logging.WARNING):
+        on_telegram = _get_platform_tools(
+            config, "telegram", include_default_mcp_servers=False
+        )
+    on_discord = _get_platform_tools(
+        config, "discord", include_default_mcp_servers=False
+    )
+
+    assert on_telegram == {"artifact_read"}, (
+        f"platform-restricted toolset survived a pin on telegram: {sorted(on_telegram)}"
+    )
+    assert "discord_admin" in caplog.text
+    assert on_discord == {"artifact_read", "discord_admin"}
+
+
+def test_exact_pin_keeps_explicitly_pinned_default_off_toolsets():
+    """Explicitly listed default-off toolsets survive, exactly as explicit
+    ``platform_toolsets`` config does — the pin is the most explicit form of
+    configuration there is, so it must not be silently narrowed."""
+    assert "spotify" in _DEFAULT_OFF_TOOLSETS
+    config = {"tools": {"enabled_toolsets": ["artifact_read", "spotify"]}}
+
+    enabled = _get_platform_tools(config, "cli", include_default_mcp_servers=False)
+
+    assert enabled == {"artifact_read", "spotify"}

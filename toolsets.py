@@ -226,6 +226,12 @@ TOOLSETS = {
         "tools": ["read_file", "write_file", "patch", "search_files"],
         "includes": []
     },
+
+    "artifact_read": {
+        "description": "Read-only artifact inspection: read and search files",
+        "tools": ["read_file", "search_files"],
+        "includes": []
+    },
     
     "tts": {
         "description": "Text-to-speech: convert text to audio with Edge TTS (free), ElevenLabs, OpenAI, or xAI",
@@ -651,6 +657,10 @@ TOOLSETS = {
 }
 
 
+# Least-privilege boundaries whose authored membership is immutable. Plugins
+# may create their own toolsets, but cannot graft mutation tools into these.
+_PROTECTED_STATIC_TOOLSETS = frozenset({"artifact_read"})
+
 
 def get_toolset(name: str, *, include_registry: bool = True) -> Optional[Dict[str, Any]]:
     """
@@ -674,6 +684,9 @@ def get_toolset(name: str, *, include_registry: bool = True) -> Optional[Dict[st
             (they have no static counterpart).
     """
     toolset = TOOLSETS.get(name)
+
+    if name in _PROTECTED_STATIC_TOOLSETS:
+        include_registry = False
 
     if not include_registry:
         # Static view only: return the built-in definition (copying the nested
@@ -766,6 +779,20 @@ def bundle_non_core_tools(toolset_name: str) -> Set[str]:
 _resolve_toolset_memo: Dict[Tuple[str, bool, int, int], List[str]] = {}
 
 
+WILDCARD_TOOLSET_ALIASES = frozenset({"all", "*"})
+
+
+def is_wildcard_toolset(name: str) -> bool:
+    """Return True if ``name`` is an alias expanding to every known toolset.
+
+    ``all``/``*`` are convenience aliases for interactive and composite config.
+    Callers that must honour an *exact* allowlist (e.g. the profile capability
+    pin in :mod:`hermes_cli.tools_config`) have to reject them explicitly —
+    :func:`validate_toolset` deliberately accepts them.
+    """
+    return name in WILDCARD_TOOLSET_ALIASES
+
+
 def resolve_toolset(name: str, visited: Set[str] = None, *, include_registry: bool = True) -> List[str]:
     """
     Recursively resolve a toolset to get all tool names.
@@ -806,7 +833,7 @@ def resolve_toolset(name: str, visited: Set[str] = None, *, include_registry: bo
 
     # Special aliases that represent all tools across every toolset
     # This ensures future toolsets are automatically included without changes.
-    if name in {"all", "*"}:
+    if is_wildcard_toolset(name):
         all_tools: Set[str] = set()
         for toolset_name in get_toolset_names():
             # Use a fresh visited set per branch to avoid cross-branch contamination
@@ -982,7 +1009,7 @@ def validate_toolset(name: str) -> bool:
         bool: True if valid, False otherwise
     """
     # Accept special alias names for convenience
-    if name in {"all", "*"}:
+    if is_wildcard_toolset(name):
         return True
     if name in TOOLSETS:
         return True

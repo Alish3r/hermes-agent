@@ -2421,6 +2421,36 @@ def test_load_enabled_toolsets_folds_project_into_focus_posture(monkeypatch):
     assert server._load_enabled_toolsets("tui") == ["coding", "figma", "project"]
 
 
+def test_load_enabled_toolsets_exact_profile_pin_blocks_focus_and_gui_augmentation(monkeypatch):
+    monkeypatch.delenv("HERMES_TUI_TOOLSETS", raising=False)
+    import agent.coding_context as cc
+    import hermes_cli.config as config_mod
+
+    monkeypatch.setattr(cc, "coding_selection", lambda **_: ["coding"])
+    monkeypatch.setattr(
+        config_mod,
+        "load_config",
+        lambda: {"tools": {"enabled_toolsets": ["artifact_read"]}},
+    )
+
+    assert server._load_enabled_toolsets("desktop") == ["artifact_read"]
+
+
+def test_load_enabled_toolsets_preserves_exact_empty_profile_pin(monkeypatch):
+    monkeypatch.delenv("HERMES_TUI_TOOLSETS", raising=False)
+    import agent.coding_context as cc
+    import hermes_cli.config as config_mod
+
+    monkeypatch.setattr(cc, "coding_selection", lambda **_: ["coding"])
+    monkeypatch.setattr(
+        config_mod,
+        "load_config",
+        lambda: {"tools": {"enabled_toolsets": []}},
+    )
+
+    assert server._load_enabled_toolsets("desktop") == []
+
+
 def test_load_enabled_toolsets_rejects_disabled_mcp_env(monkeypatch, capsys):
     monkeypatch.setenv("HERMES_TUI_TOOLSETS", "mcp-off")
     monkeypatch.setitem(

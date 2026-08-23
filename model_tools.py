@@ -426,10 +426,20 @@ def _compute_tool_definitions(
 
     if enabled_toolsets is not None:
         effective_enabled_toolsets = list(enabled_toolsets)
+        exact_profile_pin = False
+        if os.environ.get("HERMES_KANBAN_TASK"):
+            try:
+                from hermes_cli.config import load_config
+                from hermes_cli.tools_config import has_exact_profile_toolset_pin
+
+                exact_profile_pin = has_exact_profile_toolset_pin(load_config() or {})
+            except Exception:
+                exact_profile_pin = False
         if (
             os.environ.get("HERMES_KANBAN_TASK")
             and not _is_delegated_child_context()
             and _is_dispatcher_owned_worker()
+            and not exact_profile_pin
             and "kanban" not in effective_enabled_toolsets
         ):
             # Dispatcher-spawned workers are scoped by HERMES_KANBAN_TASK and

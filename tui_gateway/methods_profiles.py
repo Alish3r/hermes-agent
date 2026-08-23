@@ -842,6 +842,7 @@ def _(rid, params: dict) -> dict:
         needs_cfg = (
             isinstance(params.get("disabled_skills"), list)
             or isinstance(params.get("enabled_toolsets"), list)
+            or params.get("clear_enabled_toolsets") is True
             or isinstance(params.get("enabled_mcp_servers"), list)
         )
         if needs_cfg:
@@ -879,15 +880,21 @@ def _(rid, params: dict) -> dict:
                     except Exception:
                         applied["skills"] = False
 
-                if isinstance(params.get("enabled_toolsets"), list):
+                if isinstance(params.get("enabled_toolsets"), list) or params.get("clear_enabled_toolsets") is True:
                     try:
-                        wanted = [str(t).strip() for t in params["enabled_toolsets"] if str(t).strip()]
-                        tools_cfg = cfg.get("tools") if isinstance(cfg.get("tools"), dict) else {}
-                        if wanted:
-                            tools_cfg["enabled_toolsets"] = sorted(set(wanted))
+                        from hermes_cli.tools_config import set_exact_profile_toolset_pin
+
+                        if params.get("clear_enabled_toolsets") is True:
+                            set_exact_profile_toolset_pin(cfg, None)
                         else:
-                            tools_cfg.pop("enabled_toolsets", None)
-                        cfg["tools"] = tools_cfg
+                            set_exact_profile_toolset_pin(
+                                cfg,
+                                [
+                                    str(t).strip()
+                                    for t in params["enabled_toolsets"]
+                                    if str(t).strip()
+                                ],
+                            )
                         save_config(cfg)
                         applied["toolsets"] = True
                     except Exception:

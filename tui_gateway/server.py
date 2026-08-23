@@ -4685,14 +4685,28 @@ def _load_enabled_toolsets(platform: str | None = None) -> list[str] | None:
     ]
     cfg = None
     fallback_notice = None
+    exact_profile_pin = False
 
-    # Coding posture (base Hermes): with no explicit pin, collapse to the
+    # A profile-level exact pin outranks every contextual posture and GUI
+    # affordance. Load it before coding focus can substitute broader tools.
+    if not explicit:
+        try:
+            from hermes_cli.config import load_config
+            from hermes_cli.tools_config import has_exact_profile_toolset_pin
+
+            cfg = load_config() or {}
+            exact_profile_pin = has_exact_profile_toolset_pin(cfg)
+        except Exception:
+            cfg = None
+            exact_profile_pin = False
+
+    # Coding posture (base Hermes): with no explicit or profile pin, collapse to the
     # coding toolset (+ enabled MCP servers) when sitting in a code workspace.
     # The desktop app and `hermes --tui` both land here. See
     # agent/coding_context.py. No config is loaded yet at this point, so we let
     # coding_selection() load it lazily (cli.py passes its already-resolved
     # CLI_CONFIG instead, purely to avoid a redundant read).
-    if not explicit:
+    if not explicit and not exact_profile_pin:
         try:
             from agent.coding_context import coding_selection
 
@@ -4811,6 +4825,8 @@ def _load_enabled_toolsets(platform: str | None = None) -> list[str] | None:
         enabled = _get_platform_tools(cfg, "cli", include_default_mcp_servers=True)
         if fallback_notice is not None:
             print(fallback_notice, file=sys.stderr, flush=True)
+        if exact_profile_pin:
+            return sorted(enabled)
         if not enabled:
             return None
         # The client-surface toolsets are off _HERMES_CORE_TOOLS (every other

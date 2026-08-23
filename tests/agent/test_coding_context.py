@@ -75,6 +75,16 @@ class TestCodingSelection:
         assert out is not None
         assert out[0] == cc.CODING_TOOLSET
 
+    def test_exact_profile_pin_wins_over_coding_focus(self, tmp_path):
+        _git_init(tmp_path)
+        cfg = {
+            "agent": {"coding_context": "focus"},
+            "tools": {"enabled_toolsets": ["artifact_read"]},
+        }
+        assert cc.coding_selection(
+            platform="cli", cwd=tmp_path, config=cfg
+        ) is None
+
     def test_auto_is_prompt_only(self, tmp_path):
         # Default posture must never override the user's configured toolsets —
         # off-by-default toolsets are already off, and explicit opt-ins

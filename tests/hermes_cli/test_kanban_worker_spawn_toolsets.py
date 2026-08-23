@@ -161,3 +161,19 @@ toolsets:
     assert "web" in resolved
     assert "kanban" in resolved  # recovered worker lifecycle surface
     assert resolved != ["kanban"]
+
+
+def test_resolve_worker_cli_toolsets_preserves_exact_empty_pin(monkeypatch, tmp_path):
+    root = tmp_path / ".hermes"
+    profile = root / "profiles" / "read-only"
+    profile.mkdir(parents=True)
+    root.joinpath("config.yaml").write_text("platform_toolsets:\n  cli:\n    - terminal\n")
+    profile.joinpath("config.yaml").write_text(
+        "tools:\n  enabled_toolsets: []\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(root))
+
+    from hermes_cli import kanban_db as kb
+
+    assert kb._resolve_worker_cli_toolsets(str(profile)) == []
