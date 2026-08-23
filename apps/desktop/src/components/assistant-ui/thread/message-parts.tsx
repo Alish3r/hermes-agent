@@ -140,9 +140,19 @@ const ThinkingDisclosure: FC<{
   const scrollRef = useRef<HTMLDivElement | null>(null)
   const contentRef = useRef<HTMLDivElement | null>(null)
   const enterRef = useEnterAnimation(messageRunning, timerKey)
+  // A live preview that later settles must not unmount its body — that is the
+  // "turn settled and everything jumped" shift. Latch that we showed one so
+  // the clip stays. Groups that mount already complete (earlier thoughts in
+  // a still-running turn) never latch, so they stay collapsed.
+  const sawLivePreview = useRef(false)
 
-  const open = userOpen ?? (pending && !reasoningCollapsedByDefault)
-  const isPreview = pending && userOpen === null && !reasoningCollapsedByDefault
+  if (pending && !reasoningCollapsedByDefault) {
+    sawLivePreview.current = true
+  }
+
+  const holdPreview = sawLivePreview.current && !reasoningCollapsedByDefault
+  const open = userOpen ?? (pending || holdPreview)
+  const isPreview = userOpen === null && !reasoningCollapsedByDefault && (pending || holdPreview)
 
   // Three ways a finished block can report itself. With a measured duration it
   // says so, unless the timer's whole seconds round it to "0s" — accurate and

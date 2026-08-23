@@ -569,6 +569,39 @@ describe('assistant-ui streaming renderer', () => {
     expect(container.textContent).not.toContain('```ts')
   })
 
+  it('does not collapse a live thinking preview when the turn settles', async () => {
+    let setRunning: ((running: boolean) => void) | undefined
+
+    function SettleReasoningHarness() {
+      const [running, setRunningState] = useState(true)
+      setRunning = setRunningState
+      const runtime = useExternalStoreRuntime<ThreadMessage>({
+        messages: [assistantReasoningMessage('The user asked a question.', running)],
+        isRunning: running,
+        onNew: async () => {}
+      })
+
+      return (
+        <AssistantRuntimeProvider runtime={runtime}>
+          <Thread />
+        </AssistantRuntimeProvider>
+      )
+    }
+
+    const { container } = render(<SettleReasoningHarness />)
+    const toggle = within(container).getByRole('button', { name: /thinking/i })
+
+    expect(toggle.getAttribute('aria-expanded')).toBe('true')
+    expect(container.querySelector('[data-slot="aui_reasoning-text"]')).toBeTruthy()
+
+    act(() => setRunning?.(false))
+
+    await waitFor(() => {
+      expect(within(container).getByRole('button', { name: /thought/i }).getAttribute('aria-expanded')).toBe('true')
+    })
+    expect(container.querySelector('[data-slot="aui_reasoning-text"]')).toBeTruthy()
+  })
+
   it('keeps streaming reasoning collapsed by default when the preference is enabled', () => {
     $reasoningCollapsedByDefault.set(true)
 
