@@ -2954,11 +2954,42 @@ def _resolve_use_tui(args) -> bool:
         return False
 
 
+def _apply_no_tools(args) -> None:
+    """Turn ``--no-tools`` into an explicit empty toolset pin.
+
+    Downstream readers use ``args.toolsets``. Leaving it ``None`` would mean
+    "no pin given -- resolve from config", which is the widening the flag
+    exists to prevent, so the flag is normalised to ``[]``: a pin of zero
+    toolsets. ``--toolsets`` and ``--no-tools`` are mutually exclusive at the
+    parser, so this can never overwrite a real selection.
+    """
+    if getattr(args, "no_tools", False):
+        args.toolsets = []
+
+
+def _reject_no_tools_with_tui(args, use_tui: bool) -> None:
+    """Refuse ``--no-tools --tui`` instead of quietly ignoring the pin.
+
+    The TUI receives its selection through ``HERMES_TUI_TOOLSETS``, which is
+    only set for a non-empty list, so an empty pin would be dropped and the
+    session would start with a full tool surface -- silently granting more
+    than was asked for. Failing here is loud and discoverable.
+    """
+    if use_tui and getattr(args, "no_tools", False):
+        raise SystemExit(
+            "--no-tools is not supported with --tui: the TUI would start with "
+            "its normally resolved toolsets, which is wider than the empty pin "
+            "you asked for. Drop --tui to run with zero toolsets."
+        )
+
+
 def cmd_chat(args):
     """Run interactive chat CLI."""
     use_tui = _resolve_use_tui(args)
 
     _apply_safe_mode(args)
+    _reject_no_tools_with_tui(args, use_tui)
+    _apply_no_tools(args)
 
     # --in DIR: run in DIR. Must happen before any session resolution so the
     # workspace-scoped "latest"/-c lookups key off DIR, and it pins the

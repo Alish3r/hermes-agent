@@ -10877,8 +10877,15 @@ def _default_spawn(
     if task.reasoning_effort:
         cmd.extend(["--reasoning", task.reasoning_effort])
     worker_toolsets = _resolve_worker_cli_toolsets(env.get("HERMES_HOME"))
+    # Three distinct states, and the empty one is not "unset": None means the
+    # profile has no exact pin and the child should resolve normally, [] means
+    # the pin is deliberately empty. Sending [] as ``--toolsets ""`` would be
+    # read as absent by the child and silently re-resolved, so it travels as
+    # its own flag.
     if worker_toolsets:
         cmd.extend(["--toolsets", ",".join(worker_toolsets)])
+    elif worker_toolsets is not None:
+        cmd.append("--no-tools")
     cmd.extend([
         "chat",
         "-q", prompt,

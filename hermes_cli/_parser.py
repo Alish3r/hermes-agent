@@ -161,11 +161,25 @@ def build_top_level_parser():
             "(or per-model under agent.reasoning_overrides)."
         ),
     )
-    parser.add_argument(
+    # An exact toolset pin can legitimately be EMPTY -- a deliberate
+    # least-privilege lockdown -- and that is not the same as "no pin", which
+    # means "resolve from config". ``--toolsets ""`` cannot carry the
+    # distinction: an empty value is indistinguishable from an absent flag at
+    # every downstream truthiness check. ``--no-tools`` is a separate, additive
+    # signal, so an older CLI that does not know it fails loudly on an
+    # unrecognised argument instead of silently resolving a wider tool surface.
+    _toolset_group = parser.add_mutually_exclusive_group()
+    _toolset_group.add_argument(
         "-t",
         "--toolsets",
         default=None,
         help="Comma-separated toolsets to enable for this invocation. Applies to -z/--oneshot and --tui.",
+    )
+    _toolset_group.add_argument(
+        "--no-tools",
+        action="store_true",
+        default=False,
+        help="Enable zero toolsets for this invocation (an explicit empty pin).",
     )
     parser.add_argument(
         "--resume",
@@ -334,10 +348,17 @@ def build_top_level_parser():
         default=argparse.SUPPRESS,
         help="Model to use (e.g., anthropic/claude-sonnet-4)",
     )
-    chat_parser.add_argument(
+    _chat_toolset_group = chat_parser.add_mutually_exclusive_group()
+    _chat_toolset_group.add_argument(
         "-t", "--toolsets",
         default=argparse.SUPPRESS,
         help="Comma-separated toolsets to enable",
+    )
+    _chat_toolset_group.add_argument(
+        "--no-tools",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="Enable zero toolsets (an explicit empty pin, not 'unset').",
     )
     _inherited_flag(
         chat_parser,

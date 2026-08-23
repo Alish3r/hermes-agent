@@ -919,6 +919,15 @@ from hermes_cli.banner import build_welcome_banner
 from hermes_cli.commands import SlashCommandCompleter, SlashCommandAutoSuggest
 
 
+def _is_explicit_zero_toolsets(toolsets) -> bool:
+    """True when the caller explicitly asked for zero toolsets.
+
+    Only an empty sequence means this. ``None`` is "no pin given" and a string
+    is a real selection; neither may be confused with a deliberate lockdown.
+    """
+    return isinstance(toolsets, (list, tuple)) and len(toolsets) == 0
+
+
 def get_all_toolsets(*args, **kwargs):
     from toolsets import get_all_toolsets as _get_all_toolsets
 
@@ -21051,7 +21060,13 @@ def main(
     # Parse toolsets - handle both string and tuple/list inputs
     # Default to hermes-cli toolset which includes cronjob management tools
     toolsets_list = None
-    if toolsets:
+    if _is_explicit_zero_toolsets(toolsets):
+        # ``--no-tools``: a deliberate zero-toolset pin. It must NOT fall
+        # through to the resolution branch below, which would apply the coding
+        # posture or a config-resolved surface and hand back a wider tool set
+        # than the caller asked for.
+        toolsets_list = []
+    elif toolsets:
         if isinstance(toolsets, str):
             toolsets_list = [t.strip() for t in toolsets.split(",")]
         elif isinstance(toolsets, (list, tuple)):
