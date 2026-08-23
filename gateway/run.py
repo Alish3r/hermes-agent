@@ -19648,7 +19648,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _hyg_meta = self._thread_metadata_for_source(source, self._reply_anchor_for_event(event))
 
                     try:
-                        from agent.conversation_compression import CompressionCommitFence
+                        from agent.conversation_compression import (
+                            CompressionCommitFence,
+                            classify_compression_timeout,
+                        )
                         from run_agent import AIAgent
 
                         _hyg_model, _hyg_runtime = self._resolve_session_agent_runtime(
@@ -19757,15 +19760,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                         # the turn forever.
                                         _hyg_wait_started = time.monotonic()
                                         while True:
+                                            _hyg_waited = (
+                                                time.monotonic() - _hyg_wait_started
+                                            )
+                                            _hyg_remaining_ceiling = (
+                                                _hyg_total_ceiling_seconds
+                                                - _hyg_waited
+                                            )
+                                            if _hyg_remaining_ceiling <= 0:
+                                                raise asyncio.TimeoutError
                                             # #76354 S3: charge the idle budget
                                             # from the LAST PROGRESS event, not
                                             # from the start of this wait slice —
                                             # otherwise silence can approach 2x
                                             # the configured timeout.
-                                            _slice = max(
+                                            _remaining_idle = max(
                                                 _hyg_timeout_seconds
                                                 - _hyg_commit_fence.seconds_since_progress(),
                                                 0.005,
+                                            )
+                                            _slice = min(
+                                                _remaining_idle,
+                                                _hyg_remaining_ceiling,
                                             )
                                             try:
                                                 _compressed, _ = await asyncio.wait_for(
@@ -19792,6 +19808,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                                     continue
                                                 raise
                                     except asyncio.TimeoutError:
+                                        _hyg_waited = (
+                                            time.monotonic() - _hyg_wait_started
+                                        )
+                                        _hyg_since_progress = (
+                                            _hyg_commit_fence.seconds_since_progress()
+                                        )
+                                        _hyg_timeout_reason = (
+                                            classify_compression_timeout(
+                                                idle_timeout_seconds=(
+                                                    _hyg_timeout_seconds
+                                                ),
+                                                waited_seconds=_hyg_waited,
+                                                seconds_since_progress=(
+                                                    _hyg_since_progress
+                                                ),
+                                            )
+                                        )
                                         _cancelled = None
                                         while _cancelled is None:
                                             # #76354 F1: a hung commit retains the
@@ -19839,42 +19872,79 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                                     session_key,
                                                     _hyg_failure_cooldown_seconds,
                                                 )
-                                                _record_hygiene_cooldown(
-                                                    self, session_entry.session_id,
-                                                    _hyg_cooldown,
+                                                _hyg_error = (
                                                     "session hygiene compression "
                                                     "timed out with no output from "
-                                                    "the summary model",
+                                                    "the summary model"
+                                                    if _hyg_timeout_reason
+                                                    == "idle_timeout"
+                                                    else "session hygiene compression "
+                                                    "reached its total ceiling while "
+                                                    "the summary was still progressing"
+                                                )
+                                                _record_hygiene_cooldown(
+                                                    self,
+                                                    session_entry.session_id,
+                                                    _hyg_cooldown,
+                                                    _hyg_error,
                                                 )
                                             from agent.session_activity import (
                                                 ActivityProvenance,
                                             )
+                                            _hyg_activity = (
+                                                "session hygiene compression timed out"
+                                                if _hyg_timeout_reason
+                                                == "idle_timeout"
+                                                else "session hygiene compression total "
+                                                "ceiling reached"
+                                            )
                                             _stamp_hygiene_compression_provenance(
                                                 _hyg_agent,
-                                                "session hygiene compression timed out",
+                                                _hyg_activity,
                                                 ActivityProvenance.AGENT_COMPRESSION_TIMEOUT,
                                                 "hygiene compression timeout "
                                                 "activity stamp failed",
                                             )
-                                            logger.warning(
-                                                "Session hygiene compression for session %s "
-                                                "made no progress for %.1fs "
-                                                "(total wait %.1fs, ceiling %.1fs); "
-                                                "continuing without compression",
-                                                session_entry.session_id,
-                                                _hyg_commit_fence.seconds_since_progress(),
-                                                time.monotonic() - _hyg_wait_started,
-                                                _hyg_total_ceiling_seconds,
-                                            )
-                                            _timeout_msg = (
-                                                "⚠️ Context compression timed out "
-                                                f"after {_hyg_timeout_seconds:.1f}s "
-                                                "with no output from the summary model. "
-                                                "No messages were dropped — continuing without "
-                                                "compression. Run /compress to retry, /reset for "
-                                                "a clean session, or check your "
-                                                "auxiliary.compression model configuration."
-                                            )
+                                            if _hyg_timeout_reason == "idle_timeout":
+                                                logger.warning(
+                                                    "Session hygiene compression for session %s "
+                                                    "made no progress for %.1fs "
+                                                    "(total wait %.1fs, ceiling %.1fs); "
+                                                    "continuing without compression",
+                                                    session_entry.session_id,
+                                                    _hyg_since_progress,
+                                                    _hyg_waited,
+                                                    _hyg_total_ceiling_seconds,
+                                                )
+                                                _timeout_msg = (
+                                                    "⚠️ Context compression timed out "
+                                                    f"after {_hyg_timeout_seconds:.1f}s "
+                                                    "with no output from the summary model. "
+                                                    "No messages were dropped — continuing without "
+                                                    "compression. Run /compress to retry, /reset for "
+                                                    "a clean session, or check your "
+                                                    "auxiliary.compression model configuration."
+                                                )
+                                            else:
+                                                logger.warning(
+                                                    "Session hygiene compression for session %s "
+                                                    "exceeded its %.1fs total ceiling while still "
+                                                    "streaming (last progress %.1fs ago); "
+                                                    "continuing without compression",
+                                                    session_entry.session_id,
+                                                    _hyg_total_ceiling_seconds,
+                                                    _hyg_since_progress,
+                                                )
+                                                _timeout_msg = (
+                                                    "⚠️ Context compression reached its "
+                                                    f"{_hyg_total_ceiling_seconds:.1f}s total "
+                                                    "ceiling while the summary model was still "
+                                                    "producing output. The attempt was cancelled "
+                                                    "before commit and no messages were dropped. "
+                                                    "Use /reset for immediate recovery or increase "
+                                                    "compression.hygiene_total_ceiling_seconds "
+                                                    "before retrying."
+                                                )
                                             try:
                                                 _adapter = self._adapter_for_source(source)
                                                 if _adapter and source.chat_id:

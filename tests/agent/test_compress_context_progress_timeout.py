@@ -14,14 +14,38 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from agent import conversation_compression as _cc
 from agent.conversation_compression import (
     CompressionCommitFence,
     resolve_context_compression_timeouts,
     run_compress_context_with_progress_timeout,
 )
 
+# Resolved at call time, not import time. Importing new symbols at module
+# scope makes the whole module -- including the 15 tests that predate this
+# change -- fail to COLLECT on any tree without the source change, which turns
+# a partial revert or a bisect step into 19 errors instead of 4 failures.
+def classify_compression_timeout(**kwargs):
+    return _cc.classify_compression_timeout(**kwargs)
+
+
+def _compression_cancellation_failure_class(*args, **kwargs):
+    return _cc._compression_cancellation_failure_class(*args, **kwargs)
+
 
 class TestResolveContextCompressionTimeouts:
+    def test_timeout_classifier_preserves_fresh_progress(self):
+        assert classify_compression_timeout(
+            idle_timeout_seconds=120,
+            waited_seconds=600,
+            seconds_since_progress=0.0,
+        ) == "total_ceiling"
+        assert classify_compression_timeout(
+            idle_timeout_seconds=120,
+            waited_seconds=121,
+            seconds_since_progress=120,
+        ) == "idle_timeout"
+
     def test_defaults_when_empty_cfg(self):
         idle, ceiling = resolve_context_compression_timeouts({})
         assert idle == 120.0
@@ -88,9 +112,52 @@ class TestRunCompressContextWithProgressTimeout:
         assert result_msgs is original
         assert result_prompt == "fallback-prompt"
         assert warnings, "timeout callback should fire"
+        assert len(warnings) == 1
         assert not commit_attempted.is_set(), (
             "cancelled fence must block late session mutation"
         )
+
+    def test_progressing_worker_hitting_absolute_ceiling_is_classified_as_ceiling(self):
+        """A live summary may hit the hard ceiling with a fresh progress tick.
+
+        The timeout callback must distinguish that bounded total-duration stop
+        from an idle/no-output timeout. This reproduces the incident where logs
+        said both ``last progress 0.0s ago`` and ``no summary progress``.
+        """
+        original = [{"role": "user", "content": "keep-me"}]
+        release = threading.Event()
+        callback = []
+
+        def worker(fence: CompressionCommitFence):
+            while not release.wait(timeout=0.01):
+                fence.touch_progress()
+            if not fence.begin_commit():
+                return (original, "aborted")
+            try:
+                return ([{"role": "assistant", "content": "too-late"}], "x")
+            finally:
+                fence.finish_commit()
+
+        try:
+            result = run_compress_context_with_progress_timeout(
+                worker=worker,
+                messages=original,
+                system_prompt_fallback="fallback",
+                idle_timeout_seconds=0.20,
+                total_ceiling_seconds=0.08,
+                on_timeout_reason=lambda reason, idle, waited, since: callback.append(
+                    (reason, idle, waited, since)
+                ),
+            )
+        finally:
+            release.set()
+
+        assert result == (original, "fallback")
+        assert callback
+        reason, idle, waited, since = callback[0]
+        assert reason == "total_ceiling"
+        assert waited >= 0.08
+        assert since < idle
 
     def test_progress_extends_idle_budget_until_success(self):
         original = [{"role": "user", "content": "a"}]
@@ -126,6 +193,20 @@ class TestRunCompressContextWithProgressTimeout:
         assert result_msgs == compressed
         assert result_prompt == "ok-prompt"
         assert "fence" in fence_holder
+
+    def test_cancellation_telemetry_distinguishes_fence_timeout_and_hard_stop(self):
+        fence = CompressionCommitFence()
+        hard_stop = threading.Event()
+
+        assert fence.cancel_before_commit() is True
+        assert _compression_cancellation_failure_class(
+            fence, hard_stop
+        ) == "commit_fence_cancelled"
+
+        hard_stop.set()
+        assert _compression_cancellation_failure_class(
+            fence, hard_stop
+        ) == "explicit_interrupt"
 
     def test_commit_started_before_timeout_returns_worker_result(self):
         original = [{"role": "user", "content": "a"}]
@@ -437,6 +518,64 @@ class TestCompressContextForwarderOwnsTimeout:
             "context compression timed out",
             provenance=ActivityProvenance.AGENT_COMPRESSION_TIMEOUT,
         )
+
+    def test_owned_total_ceiling_records_progressing_cause(self, monkeypatch):
+        from run_agent import AIAgent
+        from agent.context_compressor import ContextCompressor
+        from agent.session_activity import ActivityProvenance
+
+        agent = object.__new__(AIAgent)
+        agent.session_id = "s-ceiling"
+        agent._cached_system_prompt = "sys"
+        agent._emit_warning = MagicMock()
+        agent._touch_activity = MagicMock()
+        agent._build_system_prompt = MagicMock(return_value="sys")
+        agent._conversation_root_id = MagicMock(return_value=None)
+        agent.context_compressor = MagicMock()
+        agent.context_compressor._consecutive_timeout_failures = 0
+        agent.context_compressor.record_timeout_failure = (
+            ContextCompressor.record_timeout_failure.__get__(
+                agent.context_compressor, MagicMock
+            )
+        )
+        agent.context_compressor._record_compression_failure_cooldown = MagicMock()
+
+        def fake_compress(agent_obj, messages, system_message, **kwargs):
+            fence = kwargs["commit_fence"]
+            while not fence.is_cancelled:
+                fence.touch_progress()
+                time.sleep(0.01)
+            return messages, "sys"
+
+        monkeypatch.setattr(
+            "agent.conversation_compression.compress_context", fake_compress
+        )
+        monkeypatch.setattr(
+            "agent.conversation_compression.resolve_context_compression_timeouts",
+            lambda compression_cfg=None: (0.20, 0.08),
+        )
+        monkeypatch.setattr(
+            "agent.portal_tags.get_conversation_context", lambda: object()
+        )
+
+        original = [{"role": "user", "content": "stay"}]
+        out_msgs, out_prompt = AIAgent._compress_context(agent, original, "sys")
+
+        assert out_msgs is original
+        assert out_prompt == "sys"
+        cooldown_error = (
+            agent.context_compressor._record_compression_failure_cooldown.call_args[0][1]
+        )
+        assert "total ceiling" in cooldown_error
+        assert "still progressing" in cooldown_error
+        agent._touch_activity.assert_called_once_with(
+            "context compression total ceiling reached",
+            provenance=ActivityProvenance.AGENT_COMPRESSION_TIMEOUT,
+        )
+        warning = agent._emit_warning.call_args[0][0]
+        assert "total ceiling" in warning
+        assert "still producing output" in warning
+        assert "no output" not in warning
 
     def test_fallback_prompt_resolved_lazily_on_timeout(self, monkeypatch):
         """Eager prompt rebuild must not run before compression starts."""

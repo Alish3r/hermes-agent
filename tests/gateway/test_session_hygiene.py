@@ -477,7 +477,10 @@ async def test_session_hygiene_preserves_transcript_when_in_place_configured_but
 
 
 @pytest.mark.asyncio
-async def test_session_hygiene_timeout_continues_to_agent_and_sets_cooldown(monkeypatch, tmp_path):
+@pytest.mark.parametrize("timeout_kind", ["idle_timeout", "total_ceiling"])
+async def test_session_hygiene_timeout_continues_to_agent_and_sets_cooldown(
+    monkeypatch, tmp_path, timeout_kind, request
+):
     """A timed-out SessionDB-bound worker cannot compact after the live turn starts.
 
     The worker remains alive long enough to cross the old race window. The
@@ -490,6 +493,7 @@ async def test_session_hygiene_timeout_continues_to_agent_and_sets_cooldown(monk
 
     worker_started = threading.Event()
     release_worker = threading.Event()
+    request.addfinalizer(release_worker.set)
     cleanup_done = threading.Event()
     fake_db = MagicMock()
     # The DB-backed cooldown check calls this before compressing; a bare
@@ -516,7 +520,9 @@ async def test_session_hygiene_timeout_continues_to_agent_and_sets_cooldown(monk
             self, messages, *_args, commit_fence=None, **_kwargs
         ):
             worker_started.set()
-            assert release_worker.wait(timeout=2)
+            while not release_worker.wait(timeout=0.005):
+                if timeout_kind == "total_ceiling" and commit_fence is not None:
+                    commit_fence.touch_progress()
             if commit_fence is not None and not commit_fence.begin_commit():
                 return (messages, None)
             try:
@@ -535,15 +541,32 @@ async def test_session_hygiene_timeout_continues_to_agent_and_sets_cooldown(monk
     monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
 
     cfg_path = tmp_path / "config.yaml"
+    timeout_seconds = 0.20 if timeout_kind == "total_ceiling" else 0.01
+    ceiling_seconds = 0.25 if timeout_kind == "total_ceiling" else 0.20
     cfg_path.write_text(
         "compression:\n"
         "  enabled: true\n"
-        "  hygiene_timeout_seconds: 0.01\n"
+        f"  hygiene_timeout_seconds: {timeout_seconds}\n"
+        f"  hygiene_total_ceiling_seconds: {ceiling_seconds}\n"
         "  hygiene_failure_cooldown_seconds: 120\n"
     )
 
     gateway_run = importlib.import_module("gateway.run")
     GatewayRunner = gateway_run.GatewayRunner
+    wait_budgets = []
+    real_wait_for = asyncio.wait_for
+
+    wait_spans = []
+
+    async def recording_wait_for(awaitable, timeout):
+        wait_budgets.append(float(timeout))
+        started_at = time.monotonic()
+        try:
+            return await real_wait_for(awaitable, timeout=timeout)
+        finally:
+            wait_spans.append((started_at, time.monotonic()))
+
+    monkeypatch.setattr(gateway_run.asyncio, "wait_for", recording_wait_for)
 
     adapter = HygieneCaptureAdapter()
     runner = object.__new__(GatewayRunner)
@@ -610,6 +633,25 @@ async def test_session_hygiene_timeout_continues_to_agent_and_sets_cooldown(monk
     # multiple seconds), not a precise latency. 0.15s missed by ~1-8ms on
     # busy CI shards twice on 2026-07-23.
     assert elapsed < 2.0
+    if timeout_kind == "total_ceiling":
+        hygiene_budgets = [
+            value for value in wait_budgets if value <= timeout_seconds + 0.01
+        ]
+        assert len(hygiene_budgets) >= 2, hygiene_budgets
+        assert hygiene_budgets[0] == pytest.approx(timeout_seconds, abs=0.03)
+        assert min(hygiene_budgets[1:]) <= 0.08, hygiene_budgets
+        # The budgets above prove the slicing INTENT; this proves the ceiling
+        # was actually honoured. Measure the compression wait, not the whole
+        # handler: agent setup before the wait and cooldown/warning/live-turn
+        # work after it are real but unbounded by this ceiling, and folding
+        # them in is what made an earlier end-to-end bound flaky.
+        assert wait_spans, "no hygiene wait was observed"
+        wait_span = wait_spans[-1][1] - wait_spans[0][0]
+        assert wait_span <= ceiling_seconds + 0.10, (
+            f"compression wait ran {wait_span:.3f}s against a "
+            f"{ceiling_seconds}s total ceiling; an overrun of a full idle "
+            f"window ({timeout_seconds}s) is the regression this guards"
+        )
     assert worker_started.is_set()
     assert runner._run_agent.await_count == 1
     # Cooldown must be persisted to the state DB (survives restart, #74136),
@@ -618,8 +660,21 @@ async def test_session_hygiene_timeout_continues_to_agent_and_sets_cooldown(monk
     _cd_args = fake_db.record_compression_failure_cooldown.call_args[0]
     assert _cd_args[0] == "sess-timeout"
     assert _cd_args[1] > time.time()
-    timeout_warnings = [s for s in adapter.sent if "Context compression timed out" in s["content"]]
+    expected_warning = (
+        "Context compression timed out"
+        if timeout_kind == "idle_timeout"
+        else "Context compression reached its"
+    )
+    timeout_warnings = [
+        s for s in adapter.sent if expected_warning in s["content"]
+    ]
     assert len(timeout_warnings) == 1
+    cooldown_error = fake_db.record_compression_failure_cooldown.call_args[0][2]
+    if timeout_kind == "idle_timeout":
+        assert "no output" in cooldown_error
+    else:
+        assert "total ceiling" in cooldown_error
+        assert "still progressing" in cooldown_error
     fake_db.archive_and_compact.assert_not_called()
     SlowCompressAgent.last_instance.close.assert_not_called()
 

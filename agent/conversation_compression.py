@@ -64,7 +64,7 @@ import uuid
 import threading
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Literal, Optional, Tuple
 
 from agent.auxiliary_client import AuxiliaryExplicitCancellation
 from agent.context_engine import (
@@ -718,6 +718,43 @@ class CompressionCommitFence:
 # Mirror hermes_cli.config.DEFAULT_CONFIG["compression"] keys of the same name.
 DEFAULT_CONTEXT_TIMEOUT_SECONDS = 120.0
 DEFAULT_CONTEXT_TOTAL_CEILING_SECONDS = 600.0
+CompressionTimeoutReason = Literal["idle_timeout", "total_ceiling"]
+
+
+def classify_compression_timeout(
+    *,
+    idle_timeout_seconds: float,
+    waited_seconds: float,
+    seconds_since_progress: float,
+) -> CompressionTimeoutReason:
+    """Classify a pre-commit timeout without erasing recent progress.
+
+    Callers reach this helper only after their wait loop has exhausted either
+    the inactivity budget or the absolute total ceiling. Fresh progress means
+    the total ceiling — never an idle/no-output timeout — regardless of tiny
+    scheduler overshoot in ``waited_seconds``.
+    """
+    del waited_seconds  # retained in the API for diagnostics/caller symmetry
+    return (
+        "idle_timeout"
+        if float(seconds_since_progress) >= float(idle_timeout_seconds)
+        else "total_ceiling"
+    )
+
+
+def _compression_cancellation_failure_class(
+    commit_fence: Optional[CompressionCommitFence],
+    hard_cancel_event: Any,
+) -> str:
+    """Return cause-accurate attempt telemetry for auxiliary cancellation."""
+    try:
+        if hard_cancel_event is not None and bool(hard_cancel_event.is_set()):
+            return "explicit_interrupt"
+    except Exception:
+        logger.debug("compression hard-cancel event check failed", exc_info=True)
+    if commit_fence is not None and commit_fence.is_cancelled:
+        return "commit_fence_cancelled"
+    return "explicit_interrupt"
 
 # Shared daemon pool for sync compress_context timeout wraps — analogous to
 # asyncio's default executor used by gateway session hygiene's
@@ -848,6 +885,9 @@ def run_compress_context_with_progress_timeout(
     idle_timeout_seconds: float,
     total_ceiling_seconds: float,
     on_timeout: Optional[Callable[[float, float, float], None]] = None,
+    on_timeout_reason: Optional[
+        Callable[[CompressionTimeoutReason, float, float, float], None]
+    ] = None,
     on_commit_overrun: Optional[Callable[[float, float], None]] = None,
     fence: Optional[CompressionCommitFence] = None,
     telemetry_agent: Any = None,
@@ -1074,7 +1114,7 @@ def run_compress_context_with_progress_timeout(
                     # loop and re-report with the updated overrun window.
                     continue
 
-        # Idle-timeout path: cancellation won before the commit boundary.
+        # Pre-commit timeout path: cancellation won before the commit boundary.
         # The fence already blocks any future commit; F4 additionally frees
         # the timed-out worker's durable lease via the holder-qualified hook
         # so a NEW compressor can acquire the lock immediately (no ABA: the
@@ -1083,6 +1123,19 @@ def run_compress_context_with_progress_timeout(
         fence.release_cancelled_compression_lock()
         waited = time.monotonic() - wait_started
         since_progress = fence.seconds_since_progress()
+        timeout_reason = classify_compression_timeout(
+            idle_timeout_seconds=idle,
+            waited_seconds=waited,
+            seconds_since_progress=since_progress,
+        )
+        if on_timeout_reason is not None:
+            try:
+                on_timeout_reason(timeout_reason, idle, waited, since_progress)
+            except Exception:
+                logger.debug(
+                    "compress_context reason-aware timeout callback failed",
+                    exc_info=True,
+                )
         if on_timeout is not None:
             try:
                 on_timeout(idle, waited, since_progress)
@@ -1091,15 +1144,24 @@ def run_compress_context_with_progress_timeout(
                     "compress_context timeout callback failed",
                     exc_info=True,
                 )
-        else:
-            logger.warning(
-                "Context compression made no progress for %.1fs "
-                "(total wait %.1fs, ceiling %.1fs); continuing without "
-                "compression",
-                since_progress,
-                waited,
-                ceiling,
-            )
+        if on_timeout is None and on_timeout_reason is None:
+            if timeout_reason == "idle_timeout":
+                logger.warning(
+                    "Context compression made no progress for %.1fs "
+                    "(total wait %.1fs, ceiling %.1fs); continuing without "
+                    "compression",
+                    since_progress,
+                    waited,
+                    ceiling,
+                )
+            else:
+                logger.warning(
+                    "Context compression exceeded its %.1fs total ceiling "
+                    "while still streaming (last progress %.1fs ago); "
+                    "continuing without compression",
+                    ceiling,
+                    since_progress,
+                )
         # Leave the future on the shared pool: fence cancel won, so a late
         # commit cannot land (same detachment model as gateway hygiene).
         return messages, _resolve_fallback_prompt()
@@ -2833,6 +2895,7 @@ def compress_context(
 
     _activity_heartbeat: Optional[_CompressionActivityHeartbeat] = None
     messages_before_compression = None
+    _hard_cancel_event = None
     try:
         if _lock_holder is not None:
             _candidate_refresher = _CompressionLockLeaseRefresher(
@@ -3036,6 +3099,25 @@ def compress_context(
         # atomic summary in half (#23975). Explicit stop surfaces set a separate
         # Event atomically; never infer cause from the racy message fields.
         _hard_cancel_event = getattr(agent, "_hard_interrupt_requested", None)
+
+        def _compression_cancel_requested() -> bool:
+            if commit_fence is not None and commit_fence.is_cancelled:
+                return True
+            if _hard_cancel_event is None:
+                return False
+            try:
+                return bool(_hard_cancel_event.is_set())
+            except Exception:
+                logger.debug(
+                    "compression hard-cancel event check failed", exc_info=True
+                )
+                return False
+
+        _aux_cancel_check = (
+            _compression_cancel_requested
+            if commit_fence is not None or _hard_cancel_event is not None
+            else None
+        )
         try:
             # F6: never start expensive summary work for an already-cancelled
             # fence (a stale queued job admitted after host departure).
@@ -3048,7 +3130,7 @@ def compress_context(
                 compressed = messages
             else:
                 with aux_progress_hook(_progress_hook), aux_interrupt_protection(
-                    cancel_event=_hard_cancel_event
+                    cancel_check=_aux_cancel_check
                 ):
                     compressed = compress_fn(messages, **compress_kwargs)
                     # Freeze a hard stop that arrived after the final provider
@@ -3107,7 +3189,9 @@ def compress_context(
             started_at=_attempt_started_at,
             commit_status="aborted",
             split_status="aborted",
-            failure_class="explicit_interrupt",
+            failure_class=_compression_cancellation_failure_class(
+                commit_fence, _hard_cancel_event
+            ),
         )
         _existing_sp = getattr(agent, "_cached_system_prompt", None)
         if not _existing_sp:
