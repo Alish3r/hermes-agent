@@ -8134,20 +8134,40 @@ class AIAgent:
                     )
                     return system_message or ""
 
-            def _on_timeout(idle, waited, since_progress):
-                logger.warning(
-                    "Context compression made no progress for %.1fs "
-                    "(total wait %.1fs, ceiling %.1fs); continuing without "
-                    "compression",
-                    since_progress,
-                    waited,
-                    total_ceiling,
-                )
+            def _on_timeout(reason, idle, waited, since_progress):
+                idle_timeout = reason == "idle_timeout"
+                if idle_timeout:
+                    logger.warning(
+                        "Context compression made no progress for %.1fs "
+                        "(total wait %.1fs, ceiling %.1fs); continuing without "
+                        "compression",
+                        since_progress,
+                        waited,
+                        total_ceiling,
+                    )
+                    activity = "context compression timed out"
+                    durable_error = (
+                        "host compress_context timeout "
+                        "(idle: no summary progress)"
+                    )
+                else:
+                    logger.warning(
+                        "Context compression exceeded its %.1fs total ceiling "
+                        "while still streaming (last progress %.1fs ago); "
+                        "continuing without compression",
+                        total_ceiling,
+                        since_progress,
+                    )
+                    activity = "context compression total ceiling reached"
+                    durable_error = (
+                        "host compress_context timeout "
+                        "(total ceiling: summary was still progressing)"
+                    )
                 touch = getattr(self, "_touch_activity", None)
                 if callable(touch):
                     try:
                         touch(
-                            "context compression timed out",
+                            activity,
                             provenance=ActivityProvenance.AGENT_COMPRESSION_TIMEOUT,
                         )
                     except Exception:
@@ -8162,10 +8182,7 @@ class AIAgent:
                     record = getattr(compressor, "record_timeout_failure", None)
                     if callable(record):
                         try:
-                            record(
-                                "host compress_context timeout "
-                                "(no summary progress)"
-                            )
+                            record(durable_error)
                         except Exception:
                             logger.debug(
                                 "failed to record compress_context timeout "
@@ -8174,13 +8191,24 @@ class AIAgent:
                             )
                 emit = getattr(self, "_emit_warning", None)
                 if callable(emit):
-                    emit(
-                        "⚠ Context compression timed out "
-                        f"after {idle:.1f}s with no output from the summary "
-                        "model. No messages were dropped — continuing without "
-                        "compression. Run /compress to retry, /new for a clean "
-                        "session, or check auxiliary.compression."
-                    )
+                    if idle_timeout:
+                        emit(
+                            "⚠ Context compression timed out "
+                            f"after {idle:.1f}s with no output from the summary "
+                            "model. No messages were dropped — continuing without "
+                            "compression. Run /compress to retry, /new for a clean "
+                            "session, or check auxiliary.compression."
+                        )
+                    else:
+                        emit(
+                            "⚠ Context compression reached its "
+                            f"{total_ceiling:.1f}s total ceiling while the summary "
+                            "model was still producing output. The attempt was "
+                            "cancelled before commit and no messages were dropped. "
+                            "Start /new for immediate recovery or increase "
+                            "compression.context_total_ceiling_seconds before a "
+                            "manual retry."
+                        )
 
             def _on_commit_overrun(waited, ceiling):
                 # Commit-phase ceiling breach: the SessionDB mutation is in
@@ -8202,7 +8230,7 @@ class AIAgent:
                 system_prompt_fallback=_fallback_prompt,
                 idle_timeout_seconds=idle_timeout,
                 total_ceiling_seconds=total_ceiling,
-                on_timeout=_on_timeout,
+                on_timeout_reason=_on_timeout,
                 on_commit_overrun=_on_commit_overrun,
                 fence=active_fence,
                 telemetry_agent=self,

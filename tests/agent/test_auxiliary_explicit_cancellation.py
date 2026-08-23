@@ -176,6 +176,40 @@ def test_protected_silent_provider_is_isolated_and_raises_frozen_explicit_cancel
     stream.close()  # release the bounded daemon provider worker
 
 
+def test_fence_cancellation_wakes_protected_compression_owner() -> None:
+    """The host ceiling fence must be an auxiliary cancellation source."""
+    from agent.conversation_compression import CompressionCommitFence
+
+    started = threading.Event()
+    stream = _BlockingStream(started)
+    client = _GenericClient(stream)
+    fence = CompressionCommitFence()
+    outcome: dict[str, BaseException] = {}
+
+    def _worker() -> None:
+        try:
+            with aux.aux_interrupt_protection(
+                cancel_check=lambda: fence.is_cancelled
+            ):
+                _invoke_generic(client)
+        except BaseException as exc:
+            outcome["exc"] = exc
+
+    worker = threading.Thread(target=_worker, daemon=True)
+    worker.start()
+    assert started.wait(timeout=1)
+    cancelled_at = time.monotonic()
+    assert fence.cancel_before_commit() is True
+    worker.join(timeout=1)
+    elapsed = time.monotonic() - cancelled_at
+
+    assert not worker.is_alive()
+    assert isinstance(outcome.get("exc"), aux.AuxiliaryExplicitCancellation)
+    assert not client.closed.is_set()
+    assert elapsed < 0.75
+    stream.close()
+
+
 def test_codex_silent_stream_is_isolated_without_closing_shared_client() -> None:
     started = threading.Event()
     stream = _BlockingStream(started)
