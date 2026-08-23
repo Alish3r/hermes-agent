@@ -5869,6 +5869,23 @@ function isGroupPassText(text) {
 /** Deterministic @mention parse. Handles @name, @"two words" via display
  *  titles, and @everyone/@all. Names match case-insensitively against member
  *  profile names, display titles, and collapsed no-space forms. */
+function toolsetPinPayload(toolsets) {
+  // `profiles.configure` capability pin, encoded for gateways on either side
+  // of the empty-list semantics change. An older gateway reads
+  // `enabled_toolsets: []` as "clear the pin"; a newer one persists it as a
+  // pin of ZERO tools and takes `clear_enabled_toolsets: true` as the clear
+  // signal. Sending both keys for the clear case is unambiguous to each: the
+  // newer gateway checks the flag first, the older ignores the unknown flag
+  // and sees the empty list it already expects. Sending only `[]` would strip
+  // every tool from the profile on a newer gateway.
+  const list = toolsets || []
+  const enabled = list.filter(t => t.enabled)
+  if (enabled.length === list.length || enabled.length === 0) {
+    return { enabled_toolsets: [], clear_enabled_toolsets: true }
+  }
+  return { enabled_toolsets: enabled.map(t => t.name) }
+}
+
 function parseGroupChatMentions(text, members) {
   const source = String(text || '')
   const mentioned = new Set()
@@ -8515,10 +8532,8 @@ async function applyAdvancedConfig(bot, state) {
   }
 
   if (state.dirtyToolsets) {
-    const all = state.toolsets.length
-    const enabled = state.toolsets.filter(t => t.enabled)
     // All enabled (or none) = clear the pin; otherwise pin the checked set.
-    payload.enabled_toolsets = enabled.length === all || enabled.length === 0 ? [] : enabled.map(t => t.name)
+    Object.assign(payload, toolsetPinPayload(state.toolsets))
   }
 
   if (state.dirtyMcp) {
@@ -8968,9 +8983,7 @@ function CreateAgentDialog({ open, onClose, roster }) {
           capPayload.disabled_skills = caps.skills.filter(s => !s.enabled).map(s => s.name)
         }
         if (dirtyCaps.toolsets && caps) {
-          const en = caps.toolsets.filter(t => t.enabled)
-          capPayload.enabled_toolsets =
-            en.length === caps.toolsets.length || en.length === 0 ? [] : en.map(t => t.name)
+          Object.assign(capPayload, toolsetPinPayload(caps.toolsets))
         }
         if (dirtyCaps.mcp && caps) {
           capPayload.enabled_mcp_servers = caps.mcp.filter(m => m.enabled).map(m => m.name)

@@ -117,6 +117,35 @@ def test_profile_capability_rpc_persists_empty_pin_until_explicit_clear(home):
     assert "enabled_toolsets" not in config.get("tools", {})
 
 
+def test_clear_flag_wins_when_a_client_sends_both_keys(home):
+    """The desktop client sends BOTH keys to clear, and must get a clear.
+
+    It cannot know which gateway it is talking to, so ``toolsetPinPayload()``
+    emits ``clear_enabled_toolsets: true`` alongside ``enabled_toolsets: []``:
+    an older gateway ignores the flag and reads the empty list as "clear",
+    this one must read the flag and not persist a zero-tool pin. If the flag
+    ever stops taking precedence, every bot whose owner ticks all toolsets
+    loses its entire toolset.
+    """
+    srv._methods["profiles.configure"](
+        "pin-subset", {"name": "default", "enabled_toolsets": ["artifact_read"]}
+    )
+    assert yaml.safe_load((home / "config.yaml").read_text())["tools"][
+        "enabled_toolsets"
+    ] == ["artifact_read"]
+
+    response = srv._methods["profiles.configure"](
+        "clear-both",
+        {"name": "default", "enabled_toolsets": [], "clear_enabled_toolsets": True},
+    )
+
+    assert response["result"]["applied"]["toolsets"] is True
+    config = yaml.safe_load((home / "config.yaml").read_text())
+    assert "enabled_toolsets" not in config.get("tools", {}), (
+        "sending both keys must clear the pin, not persist a zero-tool pin"
+    )
+
+
 def test_profile_capability_rpc_rejects_unknown_exact_toolset(home):
     response = srv._methods["profiles.configure"](
         "bad-pin",

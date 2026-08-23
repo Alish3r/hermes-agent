@@ -1,11 +1,36 @@
 """Single-machine durable epic coordination and evidence service.
 
 This is a coherent extension of the Kanban board database: callers pass the
-exact board ``sqlite3.Connection`` and every service mutation uses
-``kanban_db.write_txn``. Fencing authorizes cooperating callers using this API;
-an OS user with direct SQLite/file access is outside the authorization boundary.
-Model principals and model tools must never receive a writable connection or
-direct database access.
+exact board ``sqlite3.Connection``. Fencing authorizes cooperating callers
+using this API; an OS user with direct SQLite/file access is outside the
+authorization boundary. Model principals and model tools must never receive a
+writable connection or direct database access.
+
+Every receipt-bearing service mutation runs inside ``kanban_db.write_txn`` —
+either directly, or in a private helper (``_insert_receipt`` and friends)
+invoked under a caller's open transaction. Two operations write durable state
+*outside* one, because a row transaction cannot express what they do. They are
+the complete set of exceptions, and
+``test_privileged_direct_mutations_are_exactly_the_documented_ones`` fails if a
+third appears:
+
+``initialize_schema`` owns a single ``BEGIN IMMEDIATE … COMMIT`` script.
+    It cannot take a fence or write a receipt because it runs before the tables
+    those need exist. Authority is possession of the board connection; it
+    refuses to run inside a caller's transaction so it can never commit work it
+    does not own. Its journal is the schema itself: the authoritative DDL is
+    validated before and after, so a stale or altered object fails closed
+    rather than being silently adopted.
+
+``backup_service`` publishes through ``os.link`` outside any transaction.
+    Its artifact is a file, not a row. Authority is the caller-supplied
+    destination path. It never replaces an existing target — publication is a
+    no-replace hard link into place after the copy is verified — so the
+    published file is its own durable evidence and a competing publisher loses
+    rather than clobbers.
+
+Neither exception is fenced or receipted; do not model them as service
+operations, and do not add a third bypass without recording it here.
 """
 from __future__ import annotations
 
@@ -13,11 +38,12 @@ import contextlib
 import hashlib
 import json
 import os
+import re
 import sqlite3
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Callable, Mapping, Optional
+from typing import Any, Callable, Dict, Mapping, Optional, Tuple
 
 from hermes_cli import kanban_db
 
@@ -102,86 +128,95 @@ def _digest(value: Any) -> str:
     return sha256_bytes(_canonical(value).encode("utf-8"))
 
 
-_EXPECTED_TABLE_COLUMNS = {
-    "epic_leases": [
-        ("scope", "TEXT", 1), ("owner", "TEXT", 0),
-        ("token", "INTEGER", 0), ("expires_at", "INTEGER", 0),
-    ],
-    "epic_evidence": [
-        ("digest", "TEXT", 1), ("media_type", "TEXT", 0),
-        ("size", "INTEGER", 0), ("body", "BLOB", 0),
-        ("created_at", "INTEGER", 0),
-    ],
-    "epic_receipts": [
-        ("operation_id", "TEXT", 1), ("scope", "TEXT", 0),
-        ("operation", "TEXT", 0), ("request_digest", "TEXT", 0),
-        ("owner", "TEXT", 0), ("fence_token", "INTEGER", 0),
-        ("kind", "TEXT", 0), ("outcome", "TEXT", 0),
-        ("payload_json", "TEXT", 0), ("evidence_digest", "TEXT", 0),
-        ("predecessor_digest", "TEXT", 0), ("reconciliation_ref", "TEXT", 0),
-        ("created_at", "INTEGER", 0), ("transaction_digest", "TEXT", 0),
-    ],
-    "epic_chain_heads": [
-        ("scope", "TEXT", 1), ("head_digest", "TEXT", 0),
-        ("receipt_count", "INTEGER", 0),
-    ],
-    "epic_schema_meta": [
-        ("singleton", "INTEGER", 1), ("schema_version", "INTEGER", 0),
-        ("contract_digest", "TEXT", 0),
-    ],
-}
-_EXPECTED_TRIGGERS = {
-    "epic_receipts_no_update": ("before update on epic_receipts", "epic receipts are append-only"),
-    "epic_receipts_no_delete": ("before delete on epic_receipts", "epic receipts are append-only"),
-    "epic_evidence_no_update": ("before update on epic_evidence", "epic evidence is append-only"),
-    "epic_evidence_no_delete": ("before delete on epic_evidence", "epic evidence is append-only"),
-}
 _SCHEMA_VERSION = 2
 _SCHEMA_CONTRACT_DIGEST = "phase0-state-v2-chain-anchor"
 
 
 def _normalize_sql(value: str) -> str:
-    return " ".join((value or "").lower().replace("\n", " ").split())
+    """Canonical form for comparing DDL text.
+
+    SQLite stores the original ``CREATE`` statement verbatim apart from
+    dropping ``IF NOT EXISTS``, so the authoritative text in ``_SCHEMA`` is
+    directly comparable once both sides are whitespace-collapsed and made
+    insensitive to spacing around delimiters.
+
+    Case is deliberately preserved: it carries meaning inside string literals
+    and CHECK constraints, and case-folding would let a trigger that raises
+    ``'EPIC RECEIPTS ARE APPEND-ONLY'`` pass as the one that raises the
+    documented message. Only indentation and delimiter spacing are forgiven;
+    any other edit to ``_SCHEMA`` — including re-casing a keyword or respacing
+    an operator — changes the contract and needs ``_SCHEMA_VERSION`` bumped so
+    existing databases are migrated rather than silently rejected.
+    """
+    text = " ".join((value or "").split()).strip().rstrip(";").strip()
+    text = re.sub(r"\bif\s+not\s+exists\b\s*", "", text, flags=re.IGNORECASE)
+    return re.sub(r"\s*([(),])\s*", r"\1", text)
+
+
+def _expected_schema_objects() -> Dict[str, Tuple[str, str]]:
+    """Derive ``{name: (kind, normalized DDL)}`` from the authoritative schema.
+
+    Deriving this instead of hand-maintaining a parallel description is the
+    point: a constraint added to ``_SCHEMA`` cannot be one the validator then
+    forgets to require. ``sqlite3.complete_statement`` does the splitting so a
+    trigger body's internal semicolons do not truncate its statement.
+    """
+    objects: Dict[str, Tuple[str, str]] = {}
+    statement = ""
+    for line in _SCHEMA.splitlines(keepends=True):
+        statement += line
+        if not sqlite3.complete_statement(statement):
+            continue
+        match = re.match(
+            r"\s*create\s+(?:unique\s+)?(table|index|trigger)\s+"
+            r"(?:if\s+not\s+exists\s+)?([a-z_][a-z0-9_]*)",
+            statement,
+            re.IGNORECASE,
+        )
+        if match:
+            objects[match.group(2)] = (match.group(1).lower(), _normalize_sql(statement))
+        statement = ""
+    return objects
+
+
+_EXPECTED_SCHEMA_OBJECTS = _expected_schema_objects()
 
 
 def _validate_schema_contract(
     conn: sqlite3.Connection, *, allow_missing: bool = False
 ) -> None:
+    """Refuse any epic object whose DDL is not the authoritative statement.
+
+    Comparing whole normalized DDL — rather than column name/type/primary-key
+    position for tables and substrings for indexes and triggers — is what makes
+    a stale same-named object fail closed: a table that kept its column shape
+    but dropped ``NOT NULL``/``CHECK``, an index retargeted to another column
+    behind the same partial predicate, or a trigger that keeps the append-only
+    wording but selects it instead of raising it.
+    """
     objects = {
         row["name"]: (row["type"], row["sql"] or "")
         for row in conn.execute(
             "SELECT type,name,sql FROM sqlite_master WHERE name LIKE 'epic_%'"
         )
     }
-    for table, expected in _EXPECTED_TABLE_COLUMNS.items():
-        if table not in objects:
+    unexpected = sorted(set(objects) - set(_EXPECTED_SCHEMA_OBJECTS))
+    if unexpected:
+        # Also the backstop for the derivation itself: a statement the parser
+        # fails to recognise is absent from the expected set, so without this
+        # it would be created and then never validated again.
+        raise IntegrityError(
+            "schema contract has unexpected epic object(s): " + ", ".join(unexpected)
+        )
+    for name, (kind, expected_sql) in _EXPECTED_SCHEMA_OBJECTS.items():
+        found = objects.get(name)
+        if found is None:
             if allow_missing:
                 continue
-            raise IntegrityError(f"schema contract missing table {table}")
-        actual = [
-            (str(row["name"]), str(row["type"]).upper(), int(row["pk"]))
-            for row in conn.execute(
-                "SELECT name,type,pk FROM pragma_table_info(?)", (table,)
-            )
-        ]
-        if actual != expected:
-            raise IntegrityError(f"schema contract mismatch for table {table}")
-    for trigger, (shape, message) in _EXPECTED_TRIGGERS.items():
-        if trigger not in objects:
-            if allow_missing:
-                continue
-            raise IntegrityError(f"schema contract missing trigger {trigger}")
-        sql = _normalize_sql(objects[trigger][1])
-        if shape not in sql or message not in sql:
-            raise IntegrityError(f"schema contract mismatch for trigger {trigger}")
-    index = objects.get("epic_receipts_one_reconciliation")
-    if index is None:
-        if not allow_missing:
-            raise IntegrityError("schema contract missing reconciliation index")
-    else:
-        sql = _normalize_sql(index[1])
-        if "unique index" not in sql or "where reconciliation_ref is not null" not in sql:
-            raise IntegrityError("schema contract mismatch for reconciliation index")
+            raise IntegrityError(f"schema contract missing {kind} {name}")
+        actual_kind, actual_sql = found
+        if actual_kind != kind or _normalize_sql(actual_sql) != expected_sql:
+            raise IntegrityError(f"schema contract mismatch for {kind} {name}")
     if "epic_schema_meta" in objects:
         meta = conn.execute(
             "SELECT schema_version,contract_digest FROM epic_schema_meta WHERE singleton=1"

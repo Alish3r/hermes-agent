@@ -3183,7 +3183,7 @@ def _blank_slate_minimal_toolsets(config: dict):
     config.setdefault("platform_toolsets", {})["cli"] = sorted(keep)
 
     try:
-        from toolsets import TOOLSETS
+        from toolsets import TOOLSETS, resolve_toolset
         from hermes_cli.tools_config import CONFIGURABLE_TOOLSETS, _get_plugin_toolset_keys
 
         all_keys = set()
@@ -3204,7 +3204,20 @@ def _blank_slate_minimal_toolsets(config: dict):
                 # minimal Blank Slate surface (#57315).
             all_keys.add(k)
 
-        disabled = sorted(all_keys - keep)
+        # ``disabled_toolsets`` suppresses at *tool* granularity and one tool
+        # can belong to several toolsets, so hard-suppressing a toolset that
+        # shares a tool with a kept one strips that tool from the blank slate
+        # (#57315, #58281). The skips above name the categories known to do
+        # this; enforce the underlying rule directly so a newly added leaf —
+        # ``artifact_read``, whose read_file/search_files are already in
+        # ``file`` — cannot reintroduce the bug by being added to TOOLSETS.
+        kept_tools = set()
+        for kept in keep:
+            kept_tools.update(resolve_toolset(kept))
+        disabled = sorted(
+            key for key in all_keys - keep
+            if not (set(resolve_toolset(key)) & kept_tools)
+        )
         if disabled:
             config.setdefault("agent", {})["disabled_toolsets"] = disabled
     except Exception as exc:

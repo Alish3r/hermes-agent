@@ -224,6 +224,138 @@ def test_schema_contract_rejects_stale_same_named_trigger(tmp_path):
         epic_state.initialize_schema(conn)
 
 
+def test_schema_contract_rejects_same_named_table_without_its_constraints(tmp_path):
+    """Same columns, same types, same PK — but the CHECK is gone.
+
+    A column-shape comparison passes this and then stores a negative fence
+    token. The contract is the table's DDL, not its column list.
+    """
+    conn = open_db(tmp_path / "board.db")
+    conn.execute("drop table epic_leases")
+    conn.execute(
+        "create table epic_leases "
+        "(scope TEXT PRIMARY KEY, owner TEXT, token INTEGER, expires_at INTEGER)"
+    )
+
+    with pytest.raises(epic_state.IntegrityError, match="schema contract"):
+        epic_state.initialize_schema(conn)
+
+
+def test_schema_contract_rejects_same_named_index_on_a_different_expression(tmp_path):
+    """Still UNIQUE, still the same partial predicate — indexing the wrong column.
+
+    Substring-matching the predicate accepts this while the one-reconciliation
+    invariant it is supposed to enforce is gone.
+    """
+    conn = open_db(tmp_path / "board.db")
+    conn.execute("drop index epic_receipts_one_reconciliation")
+    conn.execute(
+        "create unique index epic_receipts_one_reconciliation "
+        "on epic_receipts(operation_id) where reconciliation_ref is not null"
+    )
+
+    with pytest.raises(epic_state.IntegrityError, match="schema contract"):
+        epic_state.initialize_schema(conn)
+
+
+def test_schema_contract_rejects_trigger_keeping_the_shape_and_message(tmp_path):
+    """The adversarial trigger: right shape, right message text, no ABORT.
+
+    ``before delete on epic_receipts`` and the append-only wording are both
+    present, so a substring check passes — but the trigger selects the message
+    instead of raising it, and the delete goes through.
+    """
+    conn = open_db(tmp_path / "board.db")
+    conn.execute("drop trigger epic_receipts_no_delete")
+    conn.execute(
+        "create trigger epic_receipts_no_delete before delete on epic_receipts "
+        "begin select 'epic receipts are append-only'; end"
+    )
+
+    with pytest.raises(epic_state.IntegrityError, match="schema contract"):
+        epic_state.initialize_schema(conn)
+
+
+def test_schema_contract_accepts_the_schema_it_installs(tmp_path):
+    """Positive control: the authoritative DDL must validate against itself."""
+    conn = open_db(tmp_path / "board.db")
+    epic_state.initialize_schema(conn)
+    epic_state.initialize_schema(conn)
+
+
+def test_schema_contract_rejects_an_unexpected_epic_object(tmp_path):
+    """Anything the derivation does not know about must fail loudly.
+
+    The expected set is parsed out of ``_SCHEMA``. If the parser ever fails to
+    recognise a statement — a leading comment, a quoted identifier, a CREATE
+    VIEW, a missing terminal semicolon — that object would simply be absent
+    from the expectations and go unvalidated forever. Checking the other
+    direction as well turns every one of those silent gaps into a startup
+    error, and rejects an attacker-planted extra object for free.
+    """
+    conn = open_db(tmp_path / "board.db")
+    conn.execute("create table epic_shadow_ledger (id INTEGER PRIMARY KEY)")
+
+    with pytest.raises(epic_state.IntegrityError, match="unexpected"):
+        epic_state.initialize_schema(conn)
+
+
+def test_schema_contract_rejects_a_trigger_whose_message_only_differs_in_case(tmp_path):
+    """Case is meaning inside a string literal, so comparison must preserve it."""
+    conn = open_db(tmp_path / "board.db")
+    conn.execute("drop trigger epic_receipts_no_update")
+    conn.execute(
+        "CREATE TRIGGER epic_receipts_no_update BEFORE UPDATE ON epic_receipts "
+        "BEGIN SELECT RAISE(ABORT, 'EPIC RECEIPTS ARE APPEND-ONLY'); END"
+    )
+
+    with pytest.raises(epic_state.IntegrityError, match="schema contract"):
+        epic_state.initialize_schema(conn)
+
+
+def test_privileged_direct_mutations_are_exactly_the_documented_ones():
+    """The module contract must name every mutation that bypasses write_txn.
+
+    Service mutations run inside ``kanban_db.write_txn`` — directly, or in a
+    private helper invoked under a caller's transaction. Two operations write
+    durable state outside one, using primitives a transaction cannot cover:
+    ``executescript`` (schema bootstrap, which predates the schema) and
+    ``os.link`` (backup publication, whose artifact is a file, not a row).
+
+    This pins the escape set. A third bypass fails here until it is documented
+    in the module contract, so the docstring cannot quietly go stale again.
+    """
+    import ast
+    import inspect
+
+    tree = ast.parse(inspect.getsource(epic_state))
+    escapes: dict[str, set[str]] = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        for inner in ast.walk(node):
+            if not isinstance(inner, ast.Call) or not isinstance(inner.func, ast.Attribute):
+                continue
+            value = inner.func.value
+            if inner.func.attr == "executescript":
+                escapes.setdefault(node.name, set()).add("executescript")
+            elif (
+                inner.func.attr == "link"
+                and isinstance(value, ast.Name)
+                and value.id == "os"
+            ):
+                escapes.setdefault(node.name, set()).add("os.link")
+
+    assert escapes == {
+        "initialize_schema": {"executescript"},
+        "_publish_noreplace": {"os.link"},
+    }, escapes
+
+    contract = epic_state.__doc__ or ""
+    for named in ("initialize_schema", "backup_service", "write_txn"):
+        assert named in contract, f"module contract does not name {named}"
+
+
 def test_chain_head_anchor_detects_valid_prefix_tail_deletion(tmp_path):
     conn = open_db(tmp_path / "board.db")
     lease(conn)
