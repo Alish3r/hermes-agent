@@ -4,6 +4,15 @@ The materializer writes a complete disposable Hermes home and publishes it with
 one directory rename. It refuses all existing or live-home targets: profile
 migration and merge semantics are intentionally fail-closed in Phase 0.
 
+A materialization interrupted between the root mkdir and the final manifest
+rename leaves a target that :func:`create_shadow_profiles` refuses ("shadow
+target already exists") and :func:`read_shadow_profiles` rejects (missing
+manifest, or a leftover ``.phase0-<uuid>.staging`` entry). Both directions fail
+closed by design; recovery is to delete that target directory by hand. There is
+deliberately no automatic reclaim: a Phase 0 root is disposable, and silently
+removing a directory the caller named is exactly the behaviour these refusals
+exist to prevent.
+
 Profiles constrain model-visible tool schemas, not the OS user. ``os_sandbox``
 is therefore always false, production credentials are absent, and writable
 roles still require a later sandbox/write-reservation service before live use.
@@ -175,12 +184,34 @@ def _resolved(path: Path) -> Path:
     return Path(path).expanduser().resolve(strict=False)
 
 
+def _mkdir_0700(path: Path) -> None:
+    """Create ``path`` at exactly 0o700 regardless of the process umask.
+
+    ``mkdir(mode=...)`` is masked by the umask, so under e.g. ``0o200`` the
+    directory lands 0o500 and the very next write into it fails — leaving a
+    half-materialized target that create refuses and readback rejects. Readback
+    also asserts the exact mode, so the chmod keeps creation and verification
+    agreeing on one value.
+    """
+    path.mkdir(mode=0o700)
+    os.chmod(path, 0o700)
+
+
 def _paths_overlap(left: Path, right: Path) -> bool:
     return left == right or left in right.parents or right in left.parents
 
 
-def _assert_disposable_target(target: Path) -> None:
+def _assert_disposable_target(target: Path, raw: Path | None = None) -> None:
     from hermes_constants import get_default_hermes_root, get_hermes_home
+
+    # Checked pre-resolution: ``_resolved`` follows symlinks with strict=False,
+    # so a link whose destination does not exist resolves to that non-existent
+    # path, survives the exists() refusal below, and materialization would then
+    # build the shadow root at the link's destination instead of refusing.
+    if raw is not None and Path(raw).expanduser().is_symlink():
+        raise ShadowProfileConflict(
+            f"refusing symlinked shadow target: {raw}"
+        )
 
     live_roots = {
         _resolved(get_default_hermes_root()),
@@ -252,26 +283,26 @@ def _profile_tree(profile_dir: Path) -> dict[str, dict[str, Any]]:
 def create_shadow_profiles(target_home: Path) -> dict[str, Any]:
     """Reserve a fresh root exclusively and publish its manifest last."""
     target = _resolved(target_home)
-    _assert_disposable_target(target)
+    _assert_disposable_target(target, raw=target_home)
     for spec in SHADOW_PROFILE_SPECS.values():
         _validate_toolsets(spec)
 
     target.parent.mkdir(parents=True, exist_ok=True)
     try:
-        target.mkdir(mode=0o700)
+        _mkdir_0700(target)
     except FileExistsError as exc:
         raise ShadowProfileConflict(f"shadow target already exists: {target}") from exc
     stage = target / f".phase0-{uuid.uuid4().hex}.staging"
-    stage.mkdir(mode=0o700)
+    _mkdir_0700(stage)
     profiles_root = stage / "profiles"
-    profiles_root.mkdir(mode=0o700)
+    _mkdir_0700(profiles_root)
     manifest_profiles: dict[str, dict[str, Any]] = {}
 
     for name in sorted(SHADOW_PROFILE_SPECS):
         spec = SHADOW_PROFILE_SPECS[name]
         profile_dir = profiles_root / name
-        profile_dir.mkdir(mode=0o700)
-        (profile_dir / "skills").mkdir(mode=0o700)
+        _mkdir_0700(profile_dir)
+        _mkdir_0700(profile_dir / "skills")
 
         config = _profile_config(spec)
         policy = spec.policy()

@@ -1301,3 +1301,45 @@ def test_exact_pin_keeps_explicitly_pinned_default_off_toolsets():
     enabled = _get_platform_tools(config, "cli", include_default_mcp_servers=False)
 
     assert enabled == {"artifact_read", "spotify"}
+
+
+def test_exact_pin_does_not_absorb_portable_plugin_mcp_servers(monkeypatch):
+    """A pin must not widen from process-global plugin state.
+
+    ``enabled_mcp_server_names`` also unions MCP servers contributed in-memory
+    by Portable Agent Plugins, which are absent from the profile's own
+    config.yaml and whose tool schemas are arbitrary — they may mutate. Folding
+    those into an exact pin reaches the read-only profiles whose entire
+    contract is zero mutation authority.
+    """
+    import hermes_cli.plugins as plugins_mod
+
+    monkeypatch.setattr(
+        plugins_mod, "get_portable_mcp_server_names_nowait",
+        lambda: {"portable-plugin-server"}, raising=False,
+    )
+    config = {"tools": {"enabled_toolsets": ["artifact_read"]}}
+
+    enabled = _get_platform_tools(config, "cli")
+
+    assert enabled == {"artifact_read"}, (
+        f"exact pin absorbed process-global plugin state: {sorted(enabled)}"
+    )
+
+
+def test_exact_pin_keeps_mcp_servers_declared_in_the_profile(monkeypatch):
+    """The profile's OWN declared servers are explicit config and must survive."""
+    import hermes_cli.plugins as plugins_mod
+
+    monkeypatch.setattr(
+        plugins_mod, "get_portable_mcp_server_names_nowait",
+        lambda: {"portable-plugin-server"}, raising=False,
+    )
+    config = {
+        "tools": {"enabled_toolsets": ["artifact_read"]},
+        "mcp_servers": {"profile-own-server": {"enabled": True}},
+    }
+
+    enabled = _get_platform_tools(config, "cli")
+
+    assert enabled == {"artifact_read", "profile-own-server"}

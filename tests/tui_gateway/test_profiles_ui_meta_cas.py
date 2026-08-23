@@ -127,3 +127,43 @@ def test_profile_capability_rpc_rejects_unknown_exact_toolset(home):
     if config_path.exists():
         config = yaml.safe_load(config_path.read_text()) or {}
         assert "enabled_toolsets" not in config.get("tools", {})
+
+
+def _describe(name="default"):
+    return srv._methods["profiles.describe"]("describe", {"name": name})["result"]
+
+
+def test_describe_round_trips_a_pin_on_a_non_configurable_toolset(home):
+    """A pinned toolset must be representable in the capabilities editor.
+
+    ``profiles.describe`` builds its rows from the configurable-toolset
+    catalog, and ``artifact_read`` — the leaf every Phase 0 shadow profile
+    depends on — is not in it. Without a row the UI renders the profile as
+    having zero capabilities, and a Save writes back a pin that silently drops
+    artifact_read: the pin cannot survive a round trip through its own editor.
+    """
+    srv._methods["profiles.configure"](
+        "pin", {"name": "default", "enabled_toolsets": ["artifact_read"]}
+    )
+
+    rows = _describe()["toolsets"]
+    by_name = {row["name"]: row for row in rows}
+
+    assert "artifact_read" in by_name, (
+        f"pinned toolset absent from the capability catalog: {sorted(by_name)}"
+    )
+    assert by_name["artifact_read"]["enabled"] is True
+    assert [r["name"] for r in rows if r["enabled"]] == ["artifact_read"], (
+        "an exact pin must light up exactly its own toolsets"
+    )
+
+
+def test_describe_advertises_the_empty_pin_semantics(home):
+    """Clients must be able to detect which empty-list meaning this gateway
+    implements, rather than guessing.
+
+    ``enabled_toolsets: []`` pins zero tools here and ``clear_enabled_toolsets``
+    is the clear signal. That is the opposite of the older "empty clears the
+    pin" behaviour, so the capability is advertised explicitly.
+    """
+    assert _describe()["capabilities"]["empty_enabled_toolsets"] == "pins_empty"

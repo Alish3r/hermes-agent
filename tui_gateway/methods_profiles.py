@@ -627,6 +627,35 @@ def _(rid, params: dict) -> dict:
                     }
                 )
 
+            # A pin may name a toolset the configurable catalog does not carry
+            # (artifact_read is the least-privilege leaf every Phase 0 shadow
+            # profile depends on, and it is deliberately not configurable).
+            # Without a row the editor renders the profile as having zero
+            # capabilities and a Save writes the pin back without it, so the
+            # pin cannot survive a round trip through its own UI. Emit the
+            # pinned names too, marked pinned so a client can render them
+            # read-only if it wants to.
+            if pinned_set:
+                emitted = {row["name"] for row in toolsets_out}
+                from toolsets import TOOLSETS
+
+                for ts_name in sorted(pinned_set - emitted):
+                    definition = TOOLSETS.get(ts_name) or {}
+                    try:
+                        tool_count = len(set(resolve_toolset(ts_name)))
+                    except Exception:
+                        tool_count = 0
+                    toolsets_out.append(
+                        {
+                            "name": ts_name,
+                            "label": ts_name,
+                            "description": str(definition.get("description") or ""),
+                            "tool_count": tool_count,
+                            "enabled": True,
+                            "pinned_only": True,
+                        }
+                    )
+
             soul_path = profile_dir / "SOUL.md"
             soul = ""
             try:
@@ -682,6 +711,13 @@ def _(rid, params: dict) -> dict:
                     },
                     "skills": installed,
                     "toolsets": toolsets_out,
+                    # Which meaning this gateway gives an empty pin. Older
+                    # builds treated ``enabled_toolsets: []`` as "clear the
+                    # pin"; here it persists a zero-tool pin and
+                    # ``clear_enabled_toolsets: true`` is the clear signal.
+                    # Advertised so a client can detect the semantics instead
+                    # of guessing, since the two are silently incompatible.
+                    "capabilities": {"empty_enabled_toolsets": "pins_empty"},
                     "toolsets_pinned": pinned_set is not None,
                     "mcp_servers": mcp_out,
                 },

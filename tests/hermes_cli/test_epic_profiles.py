@@ -176,11 +176,13 @@ def test_dispatcher_does_not_augment_exact_read_only_profile_with_kanban(monkeyp
 def test_exact_pin_includes_only_explicit_profile_mcp_when_requested(monkeypatch):
     import hermes_cli.tools_config as tools_config
 
-    monkeypatch.setattr(
-        tools_config,
-        "enabled_mcp_server_names",
-        lambda _config: {"mcp-explicit"},
-    )
+    seen: dict = {}
+
+    def _fake_names(_config, *, include_portable=True):
+        seen["include_portable"] = include_portable
+        return {"mcp-explicit"}
+
+    monkeypatch.setattr(tools_config, "enabled_mcp_server_names", _fake_names)
     config = {"tools": {"enabled_toolsets": ["artifact_read"]}}
     assert _get_platform_tools(
         config, "cli", include_default_mcp_servers=False
@@ -188,6 +190,9 @@ def test_exact_pin_includes_only_explicit_profile_mcp_when_requested(monkeypatch
     assert _get_platform_tools(
         config, "cli", include_default_mcp_servers=True
     ) == {"artifact_read", "mcp-explicit"}
+    # The pin asks for profile-declared servers only: portable plugin servers
+    # are process-global state and would silently widen an "exact" pin.
+    assert seen["include_portable"] is False
 
 
 def test_exact_empty_pin_is_persisted_and_unpin_is_explicit():
@@ -387,3 +392,39 @@ def test_every_published_denial_is_classified():
         "unclassified denial(s) — add to TOOL_CONFERRED_DENIALS (if a tool "
         f"grants it) or DECLARATIVE_DENIALS: {sorted(published - known)}"
     )
+
+
+def test_dangling_symlink_target_is_refused(tmp_path):
+    """A symlink whose destination does not exist must still be refused.
+
+    ``_resolved`` follows symlinks with ``strict=False``, so a dangling link
+    resolves to its non-existent destination, passes the ``exists()`` refusal,
+    and materialization would then create the shadow root at the link's
+    destination instead of refusing.
+    """
+    destination = tmp_path / "never-created"
+    link = tmp_path / "shadow-link"
+    link.symlink_to(destination)
+
+    with pytest.raises(epic_profiles.ShadowProfileConflict):
+        epic_profiles.create_shadow_profiles(link)
+
+    assert not destination.exists(), "materialized through a dangling symlink"
+
+
+def test_materialization_is_umask_independent(tmp_path):
+    """Directory modes must not depend on the process umask.
+
+    ``mkdir(mode=0o700)`` is masked by the umask, so under e.g. ``0o200`` the
+    shadow root lands 0o500 and materialization dies with PermissionError part
+    way through, leaving a stale target that create refuses and readback
+    rejects.
+    """
+    previous = os.umask(0o200)
+    try:
+        target = tmp_path / "shadow"
+        epic_profiles.create_shadow_profiles(target)
+        assert set(epic_profiles.read_shadow_profiles(target)) == EXPECTED_NAMES
+        assert oct(os.stat(target).st_mode & 0o777) == "0o700"
+    finally:
+        os.umask(previous)

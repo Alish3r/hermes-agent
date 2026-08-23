@@ -2281,7 +2281,9 @@ def _parse_enabled_flag(value, default: bool = True) -> bool:
     return default
 
 
-def enabled_mcp_server_names(config: dict) -> Set[str]:
+def enabled_mcp_server_names(
+    config: dict, *, include_portable: bool = True
+) -> Set[str]:
     """Names of MCP servers globally enabled in config.yaml or by a plugin.
 
     Shared by the gateway/CLI platform resolver (``_get_platform_tools``) and
@@ -2296,6 +2298,13 @@ def enabled_mcp_server_names(config: dict) -> Set[str]:
     servers do — the user's opt-in is enabling the plugin itself. Without this,
     a portable server registers with the MCP runtime but its tools never reach
     the model's schema.
+
+    ``include_portable=False`` restricts the result to servers the config
+    actually declares. An exact profile toolset pin uses that: portable servers
+    live in process-global plugin state rather than the profile's config.yaml,
+    their tool schemas are arbitrary and may mutate, and folding them into a
+    pin would silently widen the least-privilege profiles whose whole contract
+    is zero mutation authority.
     """
     mcp_servers = (config or {}).get("mcp_servers") or {}
     names = {
@@ -2304,6 +2313,8 @@ def enabled_mcp_server_names(config: dict) -> Set[str]:
         if isinstance(server_cfg, dict)
         and _parse_enabled_flag(server_cfg.get("enabled", True), default=True)
     }
+    if not include_portable:
+        return names
     try:
         from hermes_cli.plugins import (
             get_plugin_manager,
@@ -2515,9 +2526,13 @@ def _get_platform_tools(
             )
             enabled -= restricted
         if include_default_mcp_servers:
-            # Profile MCP entries are explicit profile configuration. Preserve
-            # enabled entries, but never recover servers from another profile.
-            enabled.update(enabled_mcp_server_names(config))
+            # Only servers this profile's own config.yaml declares. Portable
+            # plugin servers are process-global state, not profile config, and
+            # unioning them here would widen an "exact" pin — see
+            # enabled_mcp_server_names(include_portable=...).
+            enabled.update(
+                enabled_mcp_server_names(config, include_portable=False)
+            )
         agent_cfg = config.get("agent") or {}
         disabled_toolsets = agent_cfg.get("disabled_toolsets") or []
         if disabled_toolsets:
