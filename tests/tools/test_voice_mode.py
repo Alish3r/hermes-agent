@@ -1,7 +1,9 @@
 """Tests for tools.voice_mode -- all mocked, no real microphone or API calls."""
 
 import os
+import shutil
 import struct
+import tempfile
 import time
 import wave
 from pathlib import Path
@@ -120,11 +122,27 @@ def fake_clock(monkeypatch):
 # detect_audio_environment — WSL / SSH / Docker detection
 # ============================================================================
 
+@pytest.fixture
+def short_socket_dir():
+    """A socket root short enough for AF_UNIX.
+
+    ``sockaddr_un.sun_path`` caps out near 104 bytes, and macOS pytest
+    ``tmp_path`` (``/private/var/folders/<...>/pytest-of-<user>/pytest-N/<test>0``)
+    exhausts that on its own — the bind fails with "AF_UNIX path too long"
+    before the behaviour under test is ever reached.
+    """
+    root = tempfile.mkdtemp(dir="/tmp")
+    try:
+        yield Path(root)
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
 class TestPulseSocketReachable:
-    def test_stale_socket_file_not_reachable(self, monkeypatch, tmp_path):
+    def test_stale_socket_file_not_reachable(self, monkeypatch, short_socket_dir):
         """A socket file with no listener should not count as reachable."""
         import socket as _socket
-        sock_path = tmp_path / "pulse" / "native"
+        sock_path = short_socket_dir / "pulse" / "native"
         sock_path.parent.mkdir(parents=True)
         # Create + bind, then close so the path is a stale socket file.
         s = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
@@ -132,14 +150,14 @@ class TestPulseSocketReachable:
         s.close()
         monkeypatch.delenv("PULSE_SERVER", raising=False)
         monkeypatch.delenv("PULSE_RUNTIME_PATH", raising=False)
-        monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+        monkeypatch.setenv("XDG_RUNTIME_DIR", str(short_socket_dir))
         from tools.voice_mode import _pulse_socket_reachable
         assert _pulse_socket_reachable() is False
 
-    def test_listening_socket_reachable_via_xdg_runtime(self, monkeypatch, tmp_path):
+    def test_listening_socket_reachable_via_xdg_runtime(self, monkeypatch, short_socket_dir):
         """A live PulseAudio-style socket under XDG_RUNTIME_DIR is reachable (#35622)."""
         import socket as _socket
-        sock_path = tmp_path / "pulse" / "native"
+        sock_path = short_socket_dir / "pulse" / "native"
         sock_path.parent.mkdir(parents=True)
         server = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
         server.bind(str(sock_path))
@@ -147,7 +165,7 @@ class TestPulseSocketReachable:
         try:
             monkeypatch.delenv("PULSE_SERVER", raising=False)
             monkeypatch.delenv("PULSE_RUNTIME_PATH", raising=False)
-            monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+            monkeypatch.setenv("XDG_RUNTIME_DIR", str(short_socket_dir))
             from tools.voice_mode import _pulse_socket_reachable
             assert _pulse_socket_reachable() is True
         finally:
@@ -198,7 +216,7 @@ class TestDetectAudioEnvironment:
         assert result["warnings"] == []
         assert any("SSH" in n for n in result.get("notices", []))
 
-    def test_wsl_without_pulse_blocks_voice(self, monkeypatch, tmp_path):
+    def test_wsl_without_pulse_blocks_voice(self, monkeypatch, short_socket_dir):
         """WSL without PULSE_SERVER should block voice mode."""
         monkeypatch.delenv("SSH_CLIENT", raising=False)
         monkeypatch.delenv("SSH_TTY", raising=False)
@@ -208,7 +226,7 @@ class TestDetectAudioEnvironment:
         monkeypatch.setattr("tools.voice_mode._import_audio",
                             lambda: (MagicMock(), MagicMock()))
 
-        proc_version = tmp_path / "proc_version"
+        proc_version = short_socket_dir / "proc_version"
         proc_version.write_text("Linux 5.15.0-microsoft-standard-WSL2")
 
         _real_open = open
@@ -513,9 +531,9 @@ class TestTranscribeRecording:
         assert result["filtered"] is True
 
 
-    def test_other_error_does_not_trigger_chunk(self, tmp_path, monkeypatch):
+    def test_other_error_does_not_trigger_chunk(self, short_socket_dir, monkeypatch):
         """Non-size errors from transcribe_audio are returned as-is."""
-        wav_path = tmp_path / "record.wav"
+        wav_path = short_socket_dir / "record.wav"
         n_frames = 50000
         audio = struct.pack(f"<{n_frames}h", *([1000] * n_frames))
         with wave.open(str(wav_path), "wb") as wf:
@@ -695,10 +713,20 @@ class TestCleanupTempRecordings:
 # ============================================================================
 
 class TestPlayBeep:
-    def test_beep_calls_sounddevice_play(self, mock_sd):
+    def test_beep_calls_sounddevice_play(self, mock_sd, monkeypatch):
         np = pytest.importorskip("numpy")
 
         from tools.voice_mode import play_beep
+
+        # ``_sounddevice_output_allowed`` is a hard platform check
+        # (``platform.system() != "Darwin"``), and on macOS play_beep routes
+        # through afplay and returns before touching sounddevice — so this
+        # test could only ever pass here by inheriting another test's patch,
+        # which made it order-dependent under xdist. Force the branch under
+        # test instead of depending on the host OS or on leakage.
+        monkeypatch.setattr(
+            "tools.voice_mode._sounddevice_output_allowed", lambda: True
+        )
 
         # play_beep uses polling (get_stream) + sd.stop() instead of sd.wait()
         mock_stream = MagicMock()
@@ -1376,6 +1404,7 @@ class TestDefaultInputSamplerate:
             assert wf.getframerate() == 48000
 
 
+@pytest.mark.linux_only
 class TestWSL2PowerShellFallback:
     """Regression tests for WSL2 PowerShell TTS fallback (issue #17608).
 
