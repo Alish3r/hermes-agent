@@ -556,9 +556,15 @@ async def test_session_hygiene_timeout_continues_to_agent_and_sets_cooldown(
     wait_budgets = []
     real_wait_for = asyncio.wait_for
 
+    wait_spans = []
+
     async def recording_wait_for(awaitable, timeout):
         wait_budgets.append(float(timeout))
-        return await real_wait_for(awaitable, timeout=timeout)
+        started_at = time.monotonic()
+        try:
+            return await real_wait_for(awaitable, timeout=timeout)
+        finally:
+            wait_spans.append((started_at, time.monotonic()))
 
     monkeypatch.setattr(gateway_run.asyncio, "wait_for", recording_wait_for)
 
@@ -634,6 +640,18 @@ async def test_session_hygiene_timeout_continues_to_agent_and_sets_cooldown(
         assert len(hygiene_budgets) >= 2, hygiene_budgets
         assert hygiene_budgets[0] == pytest.approx(timeout_seconds, abs=0.03)
         assert min(hygiene_budgets[1:]) <= 0.08, hygiene_budgets
+        # The budgets above prove the slicing INTENT; this proves the ceiling
+        # was actually honoured. Measure the compression wait, not the whole
+        # handler: agent setup before the wait and cooldown/warning/live-turn
+        # work after it are real but unbounded by this ceiling, and folding
+        # them into one end-to-end number is what makes such a bound flaky.
+        assert wait_spans, "no hygiene wait was observed"
+        wait_span = wait_spans[-1][1] - wait_spans[0][0]
+        assert wait_span <= ceiling_seconds + 0.10, (
+            f"compression wait ran {wait_span:.3f}s against a "
+            f"{ceiling_seconds}s total ceiling; an overrun of a full idle "
+            f"window ({timeout_seconds}s) is the regression this guards"
+        )
     assert worker_started.is_set()
     assert runner._run_agent.await_count == 1
     # Cooldown must be persisted to the state DB (survives restart, #74136),

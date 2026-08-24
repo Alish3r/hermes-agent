@@ -14,13 +14,23 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from agent import conversation_compression as _cc
 from agent.conversation_compression import (
     CompressionCommitFence,
-    _compression_cancellation_failure_class,
-    classify_compression_timeout,
     resolve_context_compression_timeouts,
     run_compress_context_with_progress_timeout,
 )
+
+# Resolved at call time, not import time. Importing the new symbols at module
+# scope makes the whole module -- including the tests that predate this change
+# -- fail to COLLECT on any tree without the source change, turning a partial
+# revert or a bisect step into a file-wide error instead of targeted failures.
+def classify_compression_timeout(**kwargs):
+    return _cc.classify_compression_timeout(**kwargs)
+
+
+def _compression_cancellation_failure_class(*args, **kwargs):
+    return _cc._compression_cancellation_failure_class(*args, **kwargs)
 
 
 class TestResolveContextCompressionTimeouts:
