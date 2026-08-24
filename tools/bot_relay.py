@@ -91,6 +91,12 @@ class EnvelopeRefusedError(RuntimeError):
         self.reason = reason
 
 _HANDLE_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$")
+# ``connection_id`` is not free text: it reaches ``waiter_command`` through the
+# envelope and is rendered into a generated Python program, so a quote in it
+# closes a string literal and the remainder executes. Kept deliberately wider
+# than _HANDLE_RE (real ids carry dots/colons) but with no quote, backslash,
+# whitespace, slash or shell metacharacter.
+_CONNECTION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
 
 
 def relay_root(root: Path | str) -> Path:
@@ -126,12 +132,17 @@ def _normalize_roster_row(row: Any) -> Optional[dict]:
         handle = "hermes" if profile == "default" else profile
     if not _HANDLE_RE.match(handle) or not _HANDLE_RE.match(profile):
         return None
+    if not _CONNECTION_ID_RE.match(connection_id):
+        return None
     out = {
         "profile": profile,
         "handle": handle,
         "connection_id": connection_id,
-        "connection_label": str(row.get("connection_label") or "").strip()[:80],
-        "title": str(row.get("title") or "").strip()[:120],
+        # Whitespace-collapsed, not merely trimmed: both are rendered into the
+        # Bot Chat section of every bot's system prompt, where an embedded
+        # newline can open a forged section.
+        "connection_label": " ".join(str(row.get("connection_label") or "").split())[:80],
+        "title": " ".join(str(row.get("title") or "").split())[:120],
         "description": " ".join(str(row.get("description") or "").split())[:160],
     }
     # Optional explicit liveness flag (additive — the Desktop may push it).
@@ -415,6 +426,11 @@ def write_reply(
         raise ValueError(f"invalid envelope id: {envelope_id!r}")
     err = str(error or "")
     code = str(reason or "")
+    if code:
+        from tools.bot_failure_reasons import ALL_REASONS
+
+        if code not in ALL_REASONS:
+            raise ValueError(f"unknown failure reason: {code!r}")
     if not code and err:
         from tools.bot_failure_reasons import classify_agent_error
 
@@ -495,14 +511,15 @@ def waiter_command(root: Path | str, envelope: dict) -> str:
         "    if os.path.exists(p):\n"
         "        d = json.load(open(p, encoding='utf-8'))\n"
         "        if d.get('error'):\n"
-        f"            print('Delivery to {label} failed: ' + d['error'])\n"
+        f"            print('Delivery to ' + {label!r} + ' failed: ' + d['error'])\n"
         "            sys.exit(1)\n"
-        f"        print('Reply from {label}:')\n"
+        f"        print('Reply from ' + {label!r} + ':')\n"
         "        print(d.get('reply') or '(empty reply)')\n"
         "        sys.exit(0)\n"
         "    time.sleep(2)\n"
-        f"print('No reply from {label} within {REPLY_WAIT_SECONDS}s. The message may "
-        "still be delivered when the Desktop reconnects; do not resend blindly.')\n"
+        f"print('No reply from ' + {label!r} + ' within {REPLY_WAIT_SECONDS}s. "
+        "The message may still be delivered when the Desktop reconnects; "
+        "do not resend blindly.')\n"
         "sys.exit(1)\n"
     )
     return f"{shlex.quote(sys.executable or 'python3')} -c {shlex.quote(code)}"

@@ -111,3 +111,17 @@ def test_auto_retryable_set_and_predicate():
         assert not fr.is_auto_retryable(code)
     assert not fr.is_auto_retryable("")
     assert not fr.is_auto_retryable("nonsense")
+
+
+def test_load_balancer_errors_are_not_billing_exhaustion():
+    """``balance`` matched inside ``load balancer``.
+
+    This module exists so a failure is reported under its true cause; a 502
+    from a load balancer told the operator their credit had run out.
+    """
+    assert fr.classify_agent_error("upstream load balancer failed") != fr.PROVIDER_QUOTA_LIMIT
+    assert fr.classify_agent_error("502 Bad Gateway from load balancer") != fr.PROVIDER_QUOTA_LIMIT
+    assert fr.classify_agent_error("load-balancer timeout") != fr.PROVIDER_QUOTA_LIMIT
+    # and the real quota signals still classify
+    assert fr.classify_agent_error("Your balance is insufficient") == fr.PROVIDER_QUOTA_LIMIT
+    assert fr.classify_agent_error("out of funds") == fr.PROVIDER_QUOTA_LIMIT

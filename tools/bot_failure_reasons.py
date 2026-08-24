@@ -84,7 +84,7 @@ _RULES: tuple[tuple[re.Pattern[str], str], ...] = (
     (
         re.compile(
             r"(?:error code:?\s*|status(?:\s*code)?:?\s*|http\s*)402\b"
-            r"|out of funds|quota|balance",
+            r"|out of funds|quota|\bbalance\b",
             re.IGNORECASE,
         ),
         PROVIDER_QUOTA_LIMIT,
