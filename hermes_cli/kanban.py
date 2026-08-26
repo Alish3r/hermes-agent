@@ -19,6 +19,7 @@ import contextlib
 import json
 import os
 import shlex
+import sqlite3
 import sys
 import time
 from pathlib import Path
@@ -306,10 +307,11 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     )
     b_switch.add_argument("slug")
 
-    boards_sub.add_parser(
+    b_show = boards_sub.add_parser(
         "show", aliases=["current"],
         help="Print the currently-active board slug",
     )
+    b_show.add_argument("--json", action="store_true")
 
     b_rename = boards_sub.add_parser(
         "rename",
@@ -1056,7 +1058,11 @@ def kanban_command(args: argparse.Namespace) -> int:
     # reports beta as the current board even when the on-disk pointer is
     # alpha.
     if action == "boards":
-        return _dispatch_boards(args)
+        try:
+            return _dispatch_boards(args)
+        except Exception as exc:
+            print(f"kanban boards: {_bounded_board_error_message(exc)}", file=sys.stderr)
+            return 1
 
     # `--board <slug>` applies to every subcommand below by way of an
     # env-var pin for the duration of this call. Using HERMES_KANBAN_BOARD
@@ -1099,11 +1105,12 @@ def kanban_command(args: argparse.Namespace) -> int:
         # without ever reaching the repair path.
         if action == "repair":
             return _cmd_repair(args)
-        try:
-            kb.init_db()
-        except Exception as exc:
-            print(f"kanban: could not initialize database: {exc}", file=sys.stderr)
-            return 1
+        if not kb._is_delegated_child_context():
+            try:
+                kb.init_db()
+            except Exception as exc:
+                print(f"kanban: could not initialize database: {exc}", file=sys.stderr)
+                return 1
 
         handlers = {
             "init":     _cmd_init,
@@ -1158,8 +1165,8 @@ def kanban_command(args: argparse.Namespace) -> int:
             return 2
         try:
             return int(handler(args) or 0)
-        except (ValueError, RuntimeError) as exc:
-            print(f"kanban: {exc}", file=sys.stderr)
+        except (ValueError, RuntimeError, OSError, sqlite3.Error) as exc:
+            print(f"kanban: {_bounded_board_error_message(exc)}", file=sys.stderr)
             return 1
 
 
@@ -1232,12 +1239,7 @@ def _is_delegated_child_cli_mutation(args: argparse.Namespace) -> bool:
             return False
     elif action not in _DELEGATED_CHILD_DENIED_ACTIONS:
         return False
-    try:
-        from agent.delegation_context import is_delegated_child_process_context
-
-        return is_delegated_child_process_context()
-    except Exception:
-        return bool(os.environ.get("HERMES_DELEGATED_CHILD_CONTEXT"))
+    return kb._is_delegated_child_context()
 
 
 # ---------------------------------------------------------------------------
@@ -1272,19 +1274,41 @@ def _dispatch_boards(args: argparse.Namespace) -> int:
     return 2
 
 
-def _board_task_counts(slug: str) -> dict[str, int]:
-    """Return ``{status: count}`` for a board. Safe to call on an empty DB."""
+def _bounded_board_error_message(exc: Exception, *, limit: int = 500) -> str:
+    """Return one bounded diagnostic line suitable for CLI and JSON output."""
+    message = " ".join(str(exc).split()) or exc.__class__.__name__
+    if len(message) > limit:
+        message = message[: limit - 1] + "…"
+    return message
+
+
+def _board_task_counts(
+    slug: str,
+) -> tuple[Optional[dict[str, int]], Optional[dict[str, Any]]]:
+    """Return truthful counts or an explicit machine-readable read error."""
+    path = kb.kanban_db_path(board=slug)
+    if not path.exists():
+        return None, {
+            "type": "BoardDatabaseMissing",
+            "message": "Kanban board database is missing",
+            "repairable": True,
+            "repair": {
+                "action": "initialize",
+                "command": f"hermes kanban --board {slug} init",
+                "requires_writable_parent": True,
+            },
+        }
     try:
-        path = kb.kanban_db_path(board=slug)
-        if not path.exists():
-            return {}
         with kb.connect_closing(board=slug) as conn:
             rows = conn.execute(
                 "SELECT status, COUNT(*) AS n FROM tasks GROUP BY status"
             ).fetchall()
-        return {r["status"]: int(r["n"]) for r in rows}
-    except Exception:
-        return {}
+    except Exception as exc:
+        return None, {
+            "type": exc.__class__.__name__,
+            "message": _bounded_board_error_message(exc),
+        }
+    return {r["status"]: int(r["n"]) for r in rows}, None
 
 
 def _cmd_boards_list(args: argparse.Namespace) -> int:
@@ -1294,11 +1318,14 @@ def _cmd_boards_list(args: argparse.Namespace) -> int:
     current = kb.get_current_board()
     for b in boards:
         b["is_current"] = (b["slug"] == current)
-        b["counts"] = _board_task_counts(b["slug"])
-        b["total"] = sum(b["counts"].values())
+        counts, error = _board_task_counts(b["slug"])
+        b["counts"] = counts
+        b["total"] = sum(counts.values()) if counts is not None else None
+        b["error"] = error
+    has_errors = any(b["error"] is not None for b in boards)
     if getattr(args, "json", False):
         print(json.dumps(boards, indent=2, ensure_ascii=False))
-        return 0
+        return 1 if has_errors else 0
     # Human table: marker (•) for current, slug, display name, counts.
     if not boards:
         print("(no boards — create one with `hermes kanban boards create <slug>`)")
@@ -1306,11 +1333,21 @@ def _cmd_boards_list(args: argparse.Namespace) -> int:
     print(f"{'':2s}  {'SLUG':24s}  {'NAME':28s}  COUNTS")
     for b in boards:
         marker = "●" if b["is_current"] else " "
-        counts = b["counts"] or {}
-        counts_str = (
-            ", ".join(f"{k}={v}" for k, v in sorted(counts.items()))
-            or "(empty)"
-        )
+        if b["error"] is not None:
+            repair = b["error"].get("repair") or {}
+            repair_suffix = (
+                f"; repair: {repair['command']}" if repair.get("command") else ""
+            )
+            counts_str = (
+                f"ERROR: {b['error']['message']} "
+                f"(DB path: {b.get('db_path') or ''}{repair_suffix})"
+            )
+        else:
+            counts = b["counts"] or {}
+            counts_str = (
+                ", ".join(f"{k}={v}" for k, v in sorted(counts.items()))
+                or "(empty)"
+            )
         name = b.get("name") or ""
         if b.get("archived"):
             name += " [archived]"
@@ -1319,7 +1356,7 @@ def _cmd_boards_list(args: argparse.Namespace) -> int:
     print(f"Current board: {current}")
     if len(boards) > 1:
         print("Switch boards with `hermes kanban boards switch <slug>`.")
-    return 0
+    return 1 if has_errors else 0
 
 
 def _cmd_boards_create(args: argparse.Namespace) -> int:
@@ -1396,13 +1433,29 @@ def _cmd_boards_switch(args: argparse.Namespace) -> int:
 def _cmd_boards_show(args: argparse.Namespace) -> int:
     current = kb.get_current_board()
     meta = kb.read_board_metadata(current)
-    counts = _board_task_counts(current)
-    total = sum(counts.values())
+    counts, error = _board_task_counts(current)
+    total = sum(counts.values()) if counts is not None else None
+    if getattr(args, "json", False):
+        payload = {
+            **meta,
+            "is_current": True,
+            "counts": counts,
+            "total": total,
+            "error": error,
+        }
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+        return 1 if error is not None else 0
     print(f"Current board: {current}")
     print(f"  Display name: {meta.get('name', '')}")
     if meta.get("description"):
         print(f"  Description:  {meta['description']}")
     print(f"  DB path:      {meta['db_path']}")
+    if error is not None:
+        print(f"  Tasks:        ERROR: {error['message']}")
+        repair = error.get("repair") or {}
+        if repair.get("command"):
+            print(f"  Repair:       {repair['command']}")
+        return 1
     print(f"  Tasks:        {total} total"
           + (f" ({', '.join(f'{k}={v}' for k, v in sorted(counts.items()))})"
              if counts else ""))
@@ -1645,7 +1698,10 @@ def _cmd_list(args: argparse.Namespace) -> int:
     with kb.connect_closing() as conn:
         # Cheap "mini-dispatch": recompute ready so list output reflects
         # dependencies that may have cleared since the last dispatcher tick.
-        kb.recompute_ready(conn)
+        # A delegated child is a read-only observer, so it must render the
+        # already-durable state without attempting this convenience mutation.
+        if not kb._is_delegated_child_context():
+            kb.recompute_ready(conn)
         tasks = kb.list_tasks(
             conn,
             assignee=assignee,

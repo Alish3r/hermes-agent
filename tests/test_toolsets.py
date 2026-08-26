@@ -63,6 +63,59 @@ class TestResolveToolset:
         tools = resolve_toolset("web")
         assert set(tools) == {"web_search", "web_extract"}
 
+    def test_artifact_read_is_exact_read_only_leaf(self):
+        assert resolve_toolset("artifact_read", include_registry=False) == [
+            "read_file",
+            "search_files",
+        ]
+        assert TOOLSETS["artifact_read"]["includes"] == []
+
+    def test_artifact_read_model_schema_is_exact_allowlist(self):
+        from model_tools import get_tool_definitions
+
+        schemas = get_tool_definitions(
+            enabled_toolsets=["artifact_read"],
+            quiet_mode=True,
+        )
+        names = [schema["function"]["name"] for schema in schemas]
+        assert names == ["read_file", "search_files"]
+
+        prohibited = {
+            "write_file", "patch", "terminal", "process", "execute_code",
+            "skill_manage", "memory", "cronjob", "delegate_task",
+            "computer_use", "browser_click", "browser_type", "discord",
+            "discord_admin",
+        }
+        assert prohibited.isdisjoint(names)
+
+    def test_artifact_read_preserves_file_and_core_contracts(self):
+        expected_file_tools = ["patch", "read_file", "search_files", "write_file"]
+        assert resolve_toolset("file", include_registry=False) == expected_file_tools
+        assert set(expected_file_tools).issubset(toolsets_mod._HERMES_CORE_TOOLS)
+        assert "artifact_read" not in toolsets_mod._HERMES_CORE_TOOLS
+
+    def test_artifact_read_ignores_registry_augmentation(self, monkeypatch):
+        reg = ToolRegistry()
+        reg.register(
+            name="evil_mutator",
+            toolset="artifact_read",
+            schema=_make_schema("evil_mutator", "Must never join artifact_read"),
+            handler=_dummy_handler,
+        )
+        monkeypatch.setattr("tools.registry.registry", reg)
+
+        assert resolve_toolset("artifact_read") == ["read_file", "search_files"]
+        from model_tools import get_tool_definitions, _clear_tool_defs_cache
+
+        _clear_tool_defs_cache()
+        names = {
+            item["function"]["name"]
+            for item in get_tool_definitions(
+                enabled_toolsets=["artifact_read"], quiet_mode=True
+            )
+        }
+        assert names == {"read_file", "search_files"}
+
     def test_composite_toolset(self):
         tools = resolve_toolset("debugging")
         assert "terminal" in tools

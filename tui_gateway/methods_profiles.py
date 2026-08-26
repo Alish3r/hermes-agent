@@ -754,13 +754,18 @@ def _(rid, params: dict) -> dict:
     ``description`` (str), ``soul`` (str, full SOUL.md replacement),
     ``model`` + ``provider`` (both required together),
     ``disabled_skills`` (list[str], replace semantics),
-    ``enabled_toolsets`` (list[str], replace semantics; empty list clears
-    the pin so every toolset is enabled again), and
+    ``enabled_toolsets`` (list[str], exact replace semantics; an empty list
+    persists an exact zero-toolset pin), ``clear_enabled_toolsets`` (true
+    removes the exact pin and takes precedence when both fields are supplied),
+    and
     ``ui_meta_expected_revisions`` (dict[str, int], optional compare-and-swap
     preconditions for keys supplied in ``ui_meta``).
 
-    Each section is applied independently and best-effort; the result
-    reports per-section success so a UI can surface partial failures.
+    Each section is applied independently and best-effort. The result reports
+    per-section success in ``applied``. ``acknowledged.toolsets`` is
+    ``"replaced"`` or ``"cleared"`` when that exact operation was understood
+    and applied; clients must not infer clear success from transport completion
+    or from an absent acknowledgement.
     """
     name = str(params.get("name") or "").strip()
     if not name:
@@ -776,6 +781,7 @@ def _(rid, params: dict) -> dict:
             return _err(rid, 4064, f"profile '{name}' not found")
 
         applied = {}
+        acknowledged = {}
 
         if isinstance(params.get("ui_meta"), dict):
             # Client-agnostic UI metadata (avatar/pet/etc.), merged key-wise
@@ -896,6 +902,7 @@ def _(rid, params: dict) -> dict:
         needs_cfg = (
             isinstance(params.get("disabled_skills"), list)
             or isinstance(params.get("enabled_toolsets"), list)
+            or params.get("clear_enabled_toolsets") is True
             or isinstance(params.get("enabled_mcp_servers"), list)
         )
         if needs_cfg:
@@ -933,17 +940,28 @@ def _(rid, params: dict) -> dict:
                     except Exception:
                         applied["skills"] = False
 
-                if isinstance(params.get("enabled_toolsets"), list):
+                if isinstance(params.get("enabled_toolsets"), list) or params.get("clear_enabled_toolsets") is True:
                     try:
-                        wanted = [str(t).strip() for t in params["enabled_toolsets"] if str(t).strip()]
-                        tools_cfg = cfg.get("tools") if isinstance(cfg.get("tools"), dict) else {}
-                        if wanted:
-                            tools_cfg["enabled_toolsets"] = sorted(set(wanted))
+                        from hermes_cli.tools_config import set_exact_profile_toolset_pin
+
+                        if params.get("clear_enabled_toolsets") is True:
+                            set_exact_profile_toolset_pin(cfg, None)
                         else:
-                            tools_cfg.pop("enabled_toolsets", None)
-                        cfg["tools"] = tools_cfg
+                            set_exact_profile_toolset_pin(
+                                cfg,
+                                [
+                                    str(t).strip()
+                                    for t in params["enabled_toolsets"]
+                                    if str(t).strip()
+                                ],
+                            )
                         save_config(cfg)
                         applied["toolsets"] = True
+                        acknowledged["toolsets"] = (
+                            "cleared"
+                            if params.get("clear_enabled_toolsets") is True
+                            else "replaced"
+                        )
                     except Exception:
                         applied["toolsets"] = False
 
@@ -987,7 +1005,14 @@ def _(rid, params: dict) -> dict:
             finally:
                 reset_hermes_home_override(token)
 
-        return _ok(rid, {"ok": all(applied.values()) if applied else True, "applied": applied})
+        return _ok(
+            rid,
+            {
+                "ok": all(applied.values()) if applied else True,
+                "applied": applied,
+                "acknowledged": acknowledged,
+            },
+        )
     except Exception as e:
         return _err(rid, 5064, str(e))
 

@@ -203,6 +203,12 @@ TOOLSETS = {
         "tools": ["read_file", "write_file", "patch", "search_files"],
         "includes": []
     },
+
+    "artifact_read": {
+        "description": "Read-only artifact inspection: read and search files",
+        "tools": ["read_file", "search_files"],
+        "includes": []
+    },
     
     "tts": {
         "description": "Text-to-speech: convert text to audio with Edge TTS (free), ElevenLabs, OpenAI, or xAI",
@@ -624,6 +630,10 @@ TOOLSETS = {
 }
 
 
+# Least-privilege boundaries whose authored membership is immutable. Plugins
+# may create their own toolsets, but cannot graft mutation tools into these.
+_PROTECTED_STATIC_TOOLSETS = frozenset({"artifact_read"})
+
 
 def get_toolset(name: str, *, include_registry: bool = True) -> Optional[Dict[str, Any]]:
     """
@@ -647,6 +657,9 @@ def get_toolset(name: str, *, include_registry: bool = True) -> Optional[Dict[st
             (they have no static counterpart).
     """
     toolset = TOOLSETS.get(name)
+
+    if name in _PROTECTED_STATIC_TOOLSETS:
+        include_registry = False
 
     if not include_registry:
         # Static view only: return the built-in definition (copying the nested

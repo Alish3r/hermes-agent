@@ -9563,6 +9563,57 @@ function emptyAdvancedState() {
   }
 }
 
+/** Map a profiles.configure payload to the response sections it must affirm. */
+function requestedProfileConfigSections(payload) {
+  const sections = []
+
+  if (typeof payload.soul === 'string') sections.push('soul')
+  if (typeof payload.model === 'string' && typeof payload.provider === 'string') sections.push('model')
+  if (Array.isArray(payload.disabled_skills)) sections.push('skills')
+  if (Array.isArray(payload.enabled_toolsets) || payload.clear_enabled_toolsets === true) sections.push('toolsets')
+  if (Array.isArray(payload.enabled_mcp_servers)) sections.push('mcp_servers')
+
+  return sections
+}
+
+/** Require section-level acknowledgement, including the exact toolset operation. */
+function confirmedProfileConfigResult(payload, result) {
+  const applied = {}
+
+  for (const section of requestedProfileConfigSections(payload)) {
+    applied[section] = result?.applied?.[section] === true
+  }
+  if (payload.clear_enabled_toolsets === true && result?.acknowledged?.toolsets !== 'cleared') {
+    applied.toolsets = false
+  }
+  if (
+    Array.isArray(payload.enabled_toolsets) &&
+    payload.clear_enabled_toolsets !== true &&
+    result?.acknowledged?.toolsets !== 'replaced'
+  ) {
+    applied.toolsets = false
+  }
+
+  return {
+    ...result,
+    ok: result?.ok !== false && Object.values(applied).every(Boolean),
+    applied
+  }
+}
+
+/** Apply New Agent capabilities only when the gateway proves each operation. */
+async function applyProfileCapabilities(request, name, payload) {
+  const result = await request('profiles.configure', { name, ...payload })
+  const confirmed = confirmedProfileConfigResult(payload, result)
+  const failed = Object.entries(confirmed.applied).filter(([, ok]) => !ok)
+
+  if (!confirmed.ok || failed.length) {
+    const sections = failed.map(([section]) => section).join(', ') || 'requested sections'
+    throw new Error(`Gateway did not acknowledge profile capabilities: ${sections}`)
+  }
+  return confirmed
+}
+
 /** Persist only the dirty sections of the advanced editor. */
 async function applyAdvancedConfig(bot, state) {
   const payload = { name: bot.name }
@@ -9598,10 +9649,7 @@ async function applyAdvancedConfig(bot, state) {
   }
 
   if (state.dirtyToolsets) {
-    const all = state.toolsets.length
-    const enabled = state.toolsets.filter(t => t.enabled)
-    // All enabled (or none) = clear the pin; otherwise pin the checked set.
-    payload.enabled_toolsets = enabled.length === all || enabled.length === 0 ? [] : enabled.map(t => t.name)
+    Object.assign(payload, profileToolsetSelectionPatch(state.toolsets))
   }
 
   if (state.dirtyMcp) {
@@ -9613,9 +9661,23 @@ async function applyAdvancedConfig(bot, state) {
   }
 
   const result = await requestForBot(bot, 'profiles.configure', payload)
-  const merged = { ...applied, ...(result?.applied || {}) }
+  const confirmed = confirmedProfileConfigResult(payload, result)
+  const merged = { ...applied, ...confirmed.applied }
 
-  return { ...result, ok: Object.values(merged).every(Boolean), applied: merged }
+  return { ...result, ok: confirmed.ok && Object.values(merged).every(Boolean), applied: merged }
+}
+
+/** Serialize a checkbox selection without overloading an empty list as clear. */
+function profileToolsetSelectionPatch(toolsets) {
+  const available = Array.isArray(toolsets) ? toolsets : []
+  const enabled = available.filter(toolset => toolset.enabled).map(toolset => toolset.name)
+
+  if (available.length > 0 && enabled.length === available.length) {
+    // ``enabled_toolsets`` is the mixed-version compatibility representation;
+    // current gateways let the explicit clear win and acknowledge that mode.
+    return { enabled_toolsets: enabled, clear_enabled_toolsets: true }
+  }
+  return { enabled_toolsets: enabled }
 }
 
 // ── edit profile dialog ──────────────────────────────────────────────────────
@@ -9998,6 +10060,23 @@ function CreateAgentDialog({ open, onClose, roster }) {
     )
   }
 
+  const applySelectedCapabilities = async profile => {
+    const capPayload = {}
+
+    if (dirtyCaps.skills && caps) {
+      capPayload.disabled_skills = caps.skills.filter(s => !s.enabled).map(s => s.name)
+    }
+    if (dirtyCaps.toolsets && caps) {
+      Object.assign(capPayload, profileToolsetSelectionPatch(caps.toolsets))
+    }
+    if (dirtyCaps.mcp && caps) {
+      capPayload.enabled_mcp_servers = caps.mcp.filter(m => m.enabled).map(m => m.name)
+    }
+    if (Object.keys(capPayload).length) {
+      await applyProfileCapabilities(requestForTarget, profile, capPayload)
+    }
+  }
+
   // Materialize the profile exactly once. createdRef stores the finished slug
   // (its consumers — the taken check, draft discard on cancel, the MCP setup
   // button's profile param — all read a string); flightRef shares the
@@ -10013,7 +10092,7 @@ function CreateAgentDialog({ open, onClose, roster }) {
     }
 
     if (createdRef.current) {
-      return Promise.resolve(createdRef.current)
+      return applySelectedCapabilities(createdRef.current).then(() => createdRef.current)
     }
 
     const flight = singleFlight(flightRef, async () => {
@@ -10041,29 +10120,7 @@ function CreateAgentDialog({ open, onClose, roster }) {
       })
 
       createdRef.current = slug
-
-      // Apply capability picks from the Advanced tabs (best-effort; the
-      // profile exists either way and Edit Profile can finish the job).
-      try {
-        const capPayload = {}
-
-        if (dirtyCaps.skills && caps) {
-          capPayload.disabled_skills = caps.skills.filter(s => !s.enabled).map(s => s.name)
-        }
-        if (dirtyCaps.toolsets && caps) {
-          const en = caps.toolsets.filter(t => t.enabled)
-          capPayload.enabled_toolsets =
-            en.length === caps.toolsets.length || en.length === 0 ? [] : en.map(t => t.name)
-        }
-        if (dirtyCaps.mcp && caps) {
-          capPayload.enabled_mcp_servers = caps.mcp.filter(m => m.enabled).map(m => m.name)
-        }
-        if (Object.keys(capPayload).length) {
-          await requestForTarget('profiles.configure', { name: slug, ...capPayload })
-        }
-      } catch {
-        /* capability application is best-effort */
-      }
+      await applySelectedCapabilities(slug)
 
       if (remoteTarget) {
         // The bot lives on ANOTHER machine — local bot-meta is scoped to the

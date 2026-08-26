@@ -514,6 +514,11 @@ class RuntimeMode:
         selection (``--toolsets``, ``HERMES_TUI_TOOLSETS``, …); they never
         override a pin. Returns the profile's toolset plus enabled MCP servers.
         """
+        if config is not None:
+            from hermes_cli.tools_config import has_exact_profile_toolset_pin
+
+            if has_exact_profile_toolset_pin(config):
+                return None
         if self.config_mode != "focus":
             return None
         if self.profile.toolset is None:
@@ -654,6 +659,13 @@ def coding_selection(
     ``None`` unless the user opted into ``focus`` mode AND the posture is
     active — the default coding posture never overrides configured toolsets.
     """
+    if config is None:
+        try:
+            from hermes_cli.config import load_config_readonly
+
+            config = load_config_readonly() or {}
+        except Exception:
+            config = {}
     return resolve_runtime_mode(
         platform=platform, cwd=cwd, config=config
     ).toolset_selection(config)

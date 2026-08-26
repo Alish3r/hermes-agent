@@ -2461,6 +2461,76 @@ def test_load_enabled_toolsets_folds_project_into_focus_posture(monkeypatch):
     assert server._load_enabled_toolsets("tui") == ["coding", "figma", "project"]
 
 
+def test_load_enabled_toolsets_exact_profile_pin_blocks_focus_and_gui_augmentation(monkeypatch):
+    monkeypatch.delenv("HERMES_TUI_TOOLSETS", raising=False)
+    import agent.coding_context as cc
+    import hermes_cli.config as config_mod
+
+    monkeypatch.setattr(cc, "coding_selection", lambda **_: ["coding"])
+    monkeypatch.setattr(
+        config_mod,
+        "load_config",
+        lambda: {"tools": {"enabled_toolsets": ["artifact_read"]}},
+    )
+
+    assert server._load_enabled_toolsets("desktop") == ["artifact_read"]
+
+
+def test_load_enabled_toolsets_preserves_exact_empty_profile_pin(monkeypatch):
+    monkeypatch.delenv("HERMES_TUI_TOOLSETS", raising=False)
+    import agent.coding_context as cc
+    import hermes_cli.config as config_mod
+
+    monkeypatch.setattr(cc, "coding_selection", lambda **_: ["coding"])
+    monkeypatch.setattr(
+        config_mod,
+        "load_config",
+        lambda: {"tools": {"enabled_toolsets": []}},
+    )
+
+    assert server._load_enabled_toolsets("desktop") == []
+
+
+@pytest.mark.parametrize(
+    ("pin", "env_value", "profile_mcp", "expected"),
+    [
+        (["artifact_read"], "web", None, ["artifact_read"]),
+        (["artifact_read"], "all", None, ["artifact_read"]),
+        (["artifact_read"], "not-a-toolset", None, ["artifact_read"]),
+        (["artifact_read"], "mcp-env", None, ["artifact_read"]),
+        ([], "all", None, []),
+        ([], "web", None, []),
+        ([], "mcp-env", None, []),
+        (["not-a-toolset"], "all", None, []),
+        (["artifact_read"], "all", "mcp-profile", ["artifact_read", "mcp-profile"]),
+        ([], "all", "mcp-profile", ["mcp-profile"]),
+    ],
+)
+def test_load_enabled_toolsets_exact_profile_pin_outranks_environment_overrides(
+    monkeypatch, pin, env_value, profile_mcp, expected
+):
+    monkeypatch.setenv("HERMES_TUI_TOOLSETS", env_value)
+    monkeypatch.setitem(
+        sys.modules,
+        "hermes_cli.plugins",
+        types.SimpleNamespace(discover_plugins=lambda: None),
+    )
+
+    import hermes_cli.config as config_mod
+
+    cfg = {"tools": {"enabled_toolsets": pin}}
+    if profile_mcp is not None:
+        cfg["mcp_servers"] = {profile_mcp: {"enabled": True}}
+    monkeypatch.setattr(config_mod, "load_config", lambda: cfg)
+    monkeypatch.setattr(
+        config_mod,
+        "read_raw_config",
+        lambda: {"mcp_servers": {"mcp-env": {"enabled": True}}},
+    )
+
+    assert server._load_enabled_toolsets("desktop") == expected
+
+
 def test_load_enabled_toolsets_rejects_disabled_mcp_env(monkeypatch, capsys):
     monkeypatch.setenv("HERMES_TUI_TOOLSETS", "mcp-off")
     monkeypatch.setitem(

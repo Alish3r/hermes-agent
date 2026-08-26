@@ -5262,7 +5262,40 @@ def _load_enabled_toolsets(platform: str | None = None) -> list[str] | None:
     cfg = None
     fallback_notice = None
 
-    # Coding posture (base Hermes): with no explicit pin, collapse to the
+    # A profile-level exact pin outranks every contextual source, including the
+    # HERMES_TUI_TOOLSETS process override. Resolve it before interpreting that
+    # override so a broad host environment cannot widen a least-privilege
+    # profile. Explicit MCP entries in this same profile remain part of its
+    # exact configuration via _get_platform_tools.
+    try:
+        from hermes_cli.config import load_config
+        from hermes_cli.tools_config import (
+            _get_platform_tools,
+            has_exact_profile_toolset_pin,
+        )
+
+        cfg = load_config() or {}
+        if has_exact_profile_toolset_pin(cfg):
+            try:
+                return sorted(
+                    _get_platform_tools(
+                        cfg,
+                        "cli",
+                        include_default_mcp_servers=True,
+                    )
+                )
+            except Exception:
+                print(
+                    "[tui] exact profile toolset pin could not be resolved; "
+                    "enabling no toolsets",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                return []
+    except Exception:
+        cfg = None
+
+    # Coding posture (base Hermes): with no environment or profile pin, collapse to the
     # coding toolset (+ enabled MCP servers) when sitting in a code workspace.
     # The desktop app and `hermes --tui` both land here. See
     # agent/coding_context.py. No config is loaded yet at this point, so we let

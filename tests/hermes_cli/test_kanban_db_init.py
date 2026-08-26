@@ -1,10 +1,17 @@
 from __future__ import annotations
 
 import contextlib
+import json
+import os
 import sqlite3
 import threading
+import time
 from pathlib import Path
 
+import pytest
+
+from agent.delegation_context import delegated_child_context
+from hermes_cli import kanban as kanban_cli
 from hermes_cli import kanban_db as kb
 
 
@@ -121,6 +128,232 @@ def test_migration_is_idempotent(tmp_path, monkeypatch):
         id_col = {r["name"]: r for r in conn.execute("PRAGMA table_info(task_events)")}["id"]
         assert id_col["type"].upper() == "INTEGER"
         assert len(conn.execute("SELECT * FROM task_events").fetchall()) == 2
+
+
+def test_delegated_validation_does_not_skip_later_writable_initialization(tmp_path, monkeypatch):
+    db_path = _setup_home(tmp_path, monkeypatch)
+    with kb.connect(db_path):
+        pass
+    with sqlite3.connect(db_path) as raw:
+        raw.execute("DROP TABLE task_comments")
+        raw.commit()
+
+    resolved = str(db_path.resolve())
+    kb._INITIALIZED_PATHS.discard(resolved)
+    with delegated_child_context():
+        with kb.connect(db_path) as child:
+            assert child.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
+
+    assert resolved not in kb._INITIALIZED_PATHS
+    with kb.connect(db_path) as owner:
+        tables = {
+            row[0]
+            for row in owner.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+    assert "task_comments" in tables
+
+
+def test_delegated_init_db_does_not_mutate_writable_initialization_cache(tmp_path, monkeypatch):
+    db_path = _setup_home(tmp_path, monkeypatch)
+    with kb.connect(db_path):
+        pass
+    resolved = str(db_path.resolve())
+    assert resolved in kb._INITIALIZED_PATHS
+    before = set(kb._INITIALIZED_PATHS)
+
+    with delegated_child_context():
+        kb.init_db(db_path)
+
+    assert kb._INITIALIZED_PATHS == before
+
+
+def test_delegated_corruption_diagnostic_says_quarantine_was_not_attempted(tmp_path, monkeypatch):
+    db_path = _setup_home(tmp_path, monkeypatch)
+    with kb.connect(db_path):
+        pass
+    monkeypatch.setattr(kb, "_run_integrity_check", lambda _conn: ["database disk image is malformed"])
+
+    with delegated_child_context(), pytest.raises(kb.KanbanDbCorruptError) as exc_info:
+        kb.connect(db_path)
+
+    message = str(exc_info.value)
+    assert "quarantine was not attempted" in message.lower()
+    assert "delegate_task child contexts must not write" in message
+    assert "<backup failed>" not in message
+
+
+def test_delegated_repeated_connects_memoize_integrity_by_file_identity(tmp_path, monkeypatch):
+    db_path = _default_board_db(tmp_path, monkeypatch)
+    with kb.connect_closing(db_path):
+        pass
+    initialized_before = set(kb._INITIALIZED_PATHS)
+    calls = 0
+    real_integrity_check = kb._run_integrity_check
+
+    def counting_integrity_check(conn):
+        nonlocal calls
+        calls += 1
+        return real_integrity_check(conn)
+
+    monkeypatch.setattr(kb, "_run_integrity_check", counting_integrity_check)
+    with delegated_child_context():
+        with kb.connect_closing(db_path):
+            pass
+        with kb.connect_closing(db_path):
+            pass
+
+    assert calls == 1
+    assert kb._INITIALIZED_PATHS == initialized_before
+
+
+def test_delegated_concurrent_connects_single_flight_integrity_scan(tmp_path, monkeypatch):
+    db_path = _default_board_db(tmp_path, monkeypatch)
+    with kb.connect_closing(db_path):
+        pass
+    initialized_before = set(kb._INITIALIZED_PATHS)
+    worker_count = 12
+    start = threading.Barrier(worker_count)
+    calls = 0
+    calls_lock = threading.Lock()
+    errors: list[BaseException] = []
+    real_integrity_check = kb._run_integrity_check
+
+    def slow_counting_integrity_check(conn):
+        nonlocal calls
+        with calls_lock:
+            calls += 1
+        time.sleep(0.2)
+        return real_integrity_check(conn)
+
+    def connect_once() -> None:
+        try:
+            start.wait(timeout=5)
+            with delegated_child_context():
+                with kb.connect_closing(db_path):
+                    pass
+        except BaseException as exc:
+            errors.append(exc)
+
+    monkeypatch.setattr(kb, "_run_integrity_check", slow_counting_integrity_check)
+    threads = [threading.Thread(target=connect_once) for _ in range(worker_count)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+
+    assert not errors
+    assert all(not thread.is_alive() for thread in threads)
+    assert calls == 1
+    assert kb._INITIALIZED_PATHS == initialized_before
+
+
+def test_delegated_validation_memo_invalidates_when_file_identity_changes(tmp_path, monkeypatch):
+    db_path = _default_board_db(tmp_path, monkeypatch)
+    with kb.connect_closing(db_path):
+        pass
+    initialized_before = set(kb._INITIALIZED_PATHS)
+    calls = 0
+    real_integrity_check = kb._run_integrity_check
+
+    def counting_integrity_check(conn):
+        nonlocal calls
+        calls += 1
+        return real_integrity_check(conn)
+
+    monkeypatch.setattr(kb, "_run_integrity_check", counting_integrity_check)
+    with delegated_child_context():
+        with kb.connect_closing(db_path):
+            pass
+
+    stat_before = db_path.stat()
+    db_path.touch()
+    assert db_path.stat().st_mtime_ns != stat_before.st_mtime_ns
+
+    with delegated_child_context():
+        with kb.connect_closing(db_path):
+            pass
+
+    assert calls == 2
+    assert kb._INITIALIZED_PATHS == initialized_before
+
+
+def test_delegated_replacement_during_validation_never_memoizes_unscanned_identity(
+    tmp_path, monkeypatch
+):
+    db_path = _default_board_db(tmp_path, monkeypatch)
+    with kb.connect_closing(db_path):
+        pass
+    replacement = tmp_path / "replacement.db"
+    with kb.connect_closing(replacement):
+        pass
+    initialized_before = set(kb._INITIALIZED_PATHS)
+
+    with delegated_child_context():
+        with kb.connect_closing(db_path):
+            pass
+
+    calls = 0
+    real_integrity_check = kb._run_integrity_check
+    from hermes_cli import epic_state
+
+    real_validate_schema_contract = epic_state._validate_schema_contract
+    swapped = False
+
+    def counting_integrity_check(conn):
+        nonlocal calls
+        calls += 1
+        return real_integrity_check(conn)
+
+    def validate_then_replace(conn, *, allow_missing):
+        nonlocal swapped
+        result = real_validate_schema_contract(conn, allow_missing=allow_missing)
+        if not swapped:
+            swapped = True
+            os.replace(replacement, db_path)
+        return result
+
+    monkeypatch.setattr(kb, "_run_integrity_check", counting_integrity_check)
+    monkeypatch.setattr(epic_state, "_validate_schema_contract", validate_then_replace)
+    with delegated_child_context():
+        with kb.connect_closing(db_path):
+            pass
+    calls_after_replacement = calls
+
+    with delegated_child_context():
+        with kb.connect_closing(db_path):
+            pass
+
+    assert swapped is True
+    assert calls == calls_after_replacement + 1
+    assert kb._INITIALIZED_PATHS == initialized_before
+
+
+def test_delegated_multi_board_reads_scan_each_unchanged_board_once(tmp_path, monkeypatch):
+    default_path = _default_board_db(tmp_path, monkeypatch)
+    with kb.connect_closing(default_path):
+        pass
+    kb.create_board("beta")
+    with kb.connect_closing(board="beta"):
+        pass
+    initialized_before = set(kb._INITIALIZED_PATHS)
+    calls: list[str] = []
+    real_integrity_check = kb._run_integrity_check
+
+    def counting_integrity_check(conn):
+        calls.append(conn.execute("PRAGMA database_list").fetchone()[2])
+        return real_integrity_check(conn)
+
+    monkeypatch.setattr(kb, "_run_integrity_check", counting_integrity_check)
+    with delegated_child_context():
+        first = kanban_cli.run_slash("boards list --json")
+        second = kanban_cli.run_slash("boards list --json")
+
+    assert {row["slug"] for row in json.loads(first)} == {"default", "beta"}
+    assert {row["slug"] for row in json.loads(second)} == {"default", "beta"}
+    assert calls == [str(default_path), str(kb.kanban_db_path(board="beta"))]
+    assert kb._INITIALIZED_PATHS == initialized_before
 
 
 def test_unseen_events_for_sub_survives_migrated_db(tmp_path, monkeypatch):

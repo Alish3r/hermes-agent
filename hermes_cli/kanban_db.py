@@ -162,6 +162,16 @@ _IS_WINDOWS = sys.platform == "win32"
 KANBAN_ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024
 
 
+def _is_delegated_child_context() -> bool:
+    """Return whether this process is inside a ``delegate_task`` child."""
+    try:
+        from agent.delegation_context import is_delegated_child_process_context
+
+        return is_delegated_child_process_context()
+    except Exception:
+        return bool(os.environ.get("HERMES_DELEGATED_CHILD_CONTEXT"))
+
+
 def _assert_not_delegated_child_mutation() -> None:
     """Reject Kanban state mutations from ``delegate_task`` child contexts.
 
@@ -173,13 +183,7 @@ def _assert_not_delegated_child_mutation() -> None:
     dispatcher claims, repair events, subscriptions, GC, etc.) and every board
     metadata mutator fails closed before touching durable state.
     """
-    try:
-        from agent.delegation_context import is_delegated_child_process_context
-
-        delegated = is_delegated_child_process_context()
-    except Exception:
-        delegated = bool(os.environ.get("HERMES_DELEGATED_CHILD_CONTEXT"))
-    if delegated:
+    if _is_delegated_child_context():
         raise PermissionError(
             "delegate_task child contexts cannot mutate Kanban tasks or boards"
         )
@@ -1533,6 +1537,9 @@ CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_
 
 _INITIALIZED_PATHS: set[str] = set()
 _INIT_LOCK = threading.RLock()
+_DELEGATED_VALIDATION_MEMO: dict[str, tuple[object, ...]] = {}
+_DELEGATED_VALIDATION_LOCK = threading.RLock()
+_DELEGATED_VALIDATION_MEMO_MAX_PATHS = 256
 _SQLITE_HEADER = b"SQLite format 3\x00"
 DEFAULT_BUSY_TIMEOUT_MS = 120_000
 
@@ -1593,6 +1600,25 @@ def _sqlite_connect(path: Path) -> sqlite3.Connection:
     # the PRAGMA explicitly so it is observable and survives future wrapper
     # changes. Parameter binding is not supported for PRAGMA assignments.
     conn.execute(f"PRAGMA busy_timeout={busy_timeout_ms}")
+    return conn
+
+
+def _sqlite_connect_readonly(path: Path) -> sqlite3.Connection:
+    """Open an existing Kanban DB through SQLite's enforced read-only mode."""
+    from hermes_cli.sqlite_safe_read import connect_tracked
+
+    busy_timeout_ms = _resolve_busy_timeout_ms()
+    uri = path.resolve().as_uri() + "?mode=ro"
+    conn = connect_tracked(
+        uri,
+        tracking_path=path,
+        connect_fn=sqlite3.connect,
+        isolation_level=None,
+        timeout=busy_timeout_ms / 1000.0,
+        uri=True,
+    )
+    conn.execute(f"PRAGMA busy_timeout={busy_timeout_ms}")
+    conn.execute("PRAGMA query_only=ON")
     return conn
 
 
@@ -1882,14 +1908,28 @@ class KanbanDbCorruptError(RuntimeError):
     original path and the timestamped backup we made before refusing.
     """
 
-    def __init__(self, db_path: Path, backup_path: Optional[Path], reason: str):
+    def __init__(
+        self,
+        db_path: Path,
+        backup_path: Optional[Path],
+        reason: str,
+        *,
+        quarantine_attempted: bool = True,
+    ):
         self.db_path = db_path
         self.backup_path = backup_path
         self.reason = reason
-        backup_str = str(backup_path) if backup_path is not None else "<backup failed>"
+        if not quarantine_attempted:
+            preservation = (
+                "Original preserved; quarantine was not attempted because "
+                "delegate_task child contexts must not write."
+            )
+        else:
+            backup_str = str(backup_path) if backup_path is not None else "<backup failed>"
+            preservation = f"Original preserved; backup at {backup_str}."
         super().__init__(
             f"Refusing to open corrupt kanban DB at {db_path}: {reason}. "
-            f"Original preserved; backup at {backup_str}."
+            f"{preservation}"
         )
 
 
@@ -2324,6 +2364,94 @@ def _schema_is_present(conn: sqlite3.Connection) -> bool:
     return row is not None
 
 
+def _file_identity(path: Path) -> Optional[tuple[int, int, int, int]]:
+    """Return replacement-sensitive identity without opening or mutating a file."""
+    try:
+        info = path.stat()
+    except OSError:
+        return None
+    return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns)
+
+
+def _delegated_validation_identity(path: Path) -> tuple[object, ...]:
+    """Identify the SQLite database state visible to a read-only connection."""
+    wal = path.with_name(path.name + "-wal")
+    wal_identity = _file_identity(wal)
+    # SQLite may create an empty WAL sidecar while opening an otherwise stable
+    # database read-only. Zero bytes contain no database state, so normalize
+    # that side effect to the same identity as an absent WAL.
+    if wal_identity is not None and wal_identity[2] == 0:
+        wal_identity = None
+    return (_file_identity(path), wal_identity)
+
+
+def _delegated_validation_is_memoized(path: Path, identity: tuple[object, ...]) -> bool:
+    resolved = str(path.resolve())
+    with _DELEGATED_VALIDATION_LOCK:
+        return _DELEGATED_VALIDATION_MEMO.get(resolved) == identity
+
+
+def _memoize_delegated_validation(path: Path, identity: tuple[object, ...]) -> None:
+    resolved = str(path.resolve())
+    with _DELEGATED_VALIDATION_LOCK:
+        # Assignment replaces stale identity for this path without touching the
+        # writable initialization cache. Plain dict insertion order provides a
+        # small deterministic FIFO cap for long-lived delegated processes.
+        _DELEGATED_VALIDATION_MEMO.pop(resolved, None)
+        _DELEGATED_VALIDATION_MEMO[resolved] = identity
+        while len(_DELEGATED_VALIDATION_MEMO) > _DELEGATED_VALIDATION_MEMO_MAX_PATHS:
+            _DELEGATED_VALIDATION_MEMO.pop(next(iter(_DELEGATED_VALIDATION_MEMO)))
+
+
+def _connect_delegated_child_readonly(
+    path: Path,
+) -> sqlite3.Connection:
+    """Validate and open an already-initialized board without any mutation."""
+    # Keep the miss check, scan, and identity-bound publication in one
+    # single-flight region.  Delegated readers must never race through the
+    # same cold memo entry and repeat the expensive integrity scan.
+    with _DELEGATED_VALIDATION_LOCK:
+        if not path.is_file():
+            raise PermissionError(
+                "delegate_task child contexts may only read an already initialized "
+                "Kanban board"
+            )
+
+        _validate_sqlite_header(path)
+        identity = _delegated_validation_identity(path)
+        memoized = _delegated_validation_is_memoized(path, identity)
+        conn = _sqlite_connect_readonly(path)
+        try:
+            conn.row_factory = sqlite3.Row
+            if not _schema_is_present(conn):
+                raise PermissionError(
+                    "delegate_task child contexts may only read an already initialized "
+                    "Kanban board"
+                )
+            if not memoized:
+                messages = _run_integrity_check(conn)
+                if not _integrity_messages_ok(messages):
+                    raise KanbanDbCorruptError(
+                        path,
+                        None,
+                        "; ".join(messages),
+                        quarantine_attempted=False,
+                    )
+            from hermes_cli.epic_state import _validate_schema_contract
+
+            _validate_schema_contract(conn, allow_missing=False)
+            identity_after = _delegated_validation_identity(path)
+            # The open connection validates the pre-open identity only.  If an
+            # external replacement wins during validation, leave the new path
+            # identity cold so the next reader scans that file itself.
+            if identity_after == identity:
+                _memoize_delegated_validation(path, identity_after)
+            return conn
+        except Exception:
+            conn.close()
+            raise
+
+
 def connect(
     db_path: Optional[Path] = None,
     *,
@@ -2351,6 +2479,9 @@ def connect(
         path = db_path
     else:
         path = kanban_db_path(board=board)
+    resolved = str(path.resolve())
+    if _is_delegated_child_context():
+        return _connect_delegated_child_readonly(path)
     path.parent.mkdir(parents=True, exist_ok=True)
 
     # Fast path: once THIS process has initialized this path, the expensive
@@ -2363,7 +2494,6 @@ def connect(
     # steady-state path there is nothing for the cross-process lock to protect
     # (no schema/migration writes run), so skip it entirely and just open the
     # connection with WAL/pragmas under the cheap in-process _INIT_LOCK.
-    resolved = str(path.resolve())
     if resolved in _INITIALIZED_PATHS:
         conn = _sqlite_connect(path)
         try:
@@ -2456,6 +2586,14 @@ def connect(
                     # stale PRAGMA snapshots during gateway startup.
                     conn.executescript(SCHEMA_SQL)
                     _migrate_add_optional_columns(conn)
+                    from hermes_cli.epic_state import (
+                        initialize_schema as _initialize_epic_state,
+                        system_bootstrap_authority as _system_bootstrap_authority,
+                    )
+                    _initialize_epic_state(
+                        conn,
+                        authority=_system_bootstrap_authority(conn),
+                    )
                     _INITIALIZED_PATHS.add(resolved)
         except Exception:
             conn.close()
@@ -2517,12 +2655,16 @@ def init_db(
         path = db_path
     else:
         path = kanban_db_path(board=board)
-    path.parent.mkdir(parents=True, exist_ok=True)
+    delegated_child = _is_delegated_child_context()
+    if not delegated_child:
+        path.parent.mkdir(parents=True, exist_ok=True)
     resolved = str(path.resolve())
     # Clear the cache entry so the underlying connect() re-runs the
-    # schema + migration pass unconditionally.
-    with _INIT_LOCK:
-        _INITIALIZED_PATHS.discard(resolved)
+    # schema + migration pass unconditionally. Validate-only child reads must
+    # not influence the writable initialization cache in either direction.
+    if not delegated_child:
+        with _INIT_LOCK:
+            _INITIALIZED_PATHS.discard(resolved)
     with contextlib.closing(connect(path)):
         pass
     return path
@@ -10662,15 +10804,19 @@ def _resolve_worker_cli_toolsets(hermes_home: Optional[str]) -> Optional[list[st
     try:
         from hermes_constants import reset_hermes_home_override, set_hermes_home_override
         from hermes_cli.config import load_config
-        from hermes_cli.tools_config import _get_platform_tools
+        from hermes_cli.tools_config import (
+            _get_platform_tools,
+            has_exact_profile_toolset_pin,
+        )
 
         token = set_hermes_home_override(hermes_home)
         try:
             cfg = load_config()
+            exact_pin = has_exact_profile_toolset_pin(cfg)
             toolsets = sorted(_get_platform_tools(cfg, "cli"))
         finally:
             reset_hermes_home_override(token)
-        return toolsets or None
+        return toolsets if exact_pin else (toolsets or None)
     except Exception as exc:
         _log.debug(
             "kanban worker: could not resolve CLI toolsets for HERMES_HOME=%r (%s)",

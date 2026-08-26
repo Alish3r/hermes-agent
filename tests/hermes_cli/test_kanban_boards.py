@@ -311,11 +311,15 @@ class TestCLI:
     def test_boards_list_default_only(self, tmp_path):
         env = {"HERMES_HOME": str(tmp_path)}
         res = _cli(["boards", "list", "--json"], env_extra=env)
-        assert res.returncode == 0, res.stderr
+        assert res.returncode == 1, res.stderr
         data = json.loads(res.stdout)
         slugs = [b["slug"] for b in data]
         assert slugs == ["default"]
         assert data[0]["is_current"] is True
+        assert data[0]["counts"] is None
+        assert data[0]["total"] is None
+        assert data[0]["error"]["type"] == "BoardDatabaseMissing"
+        assert data[0]["error"]["repairable"] is True
 
 
     def test_per_board_task_isolation_via_cli(self, tmp_path):

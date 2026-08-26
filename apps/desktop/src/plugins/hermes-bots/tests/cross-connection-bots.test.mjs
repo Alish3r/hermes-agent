@@ -205,7 +205,7 @@ test('source contract: New Agent has a Create on picker that routes creation to 
   assert.match(pluginSource, /const \[targetConnection, setTargetConnection\] = useState\(''\)/)
   // Creation and configuration go through the target door, not bare host.request.
   assert.match(pluginSource, /await requestForTarget\('profiles\.create', \{/)
-  assert.match(pluginSource, /await requestForTarget\('profiles\.configure', \{ name: slug/)
+  assert.match(pluginSource, /await applyProfileCapabilities\(requestForTarget, profile, capPayload\)/)
   // The picker only renders on multi-connection registries.
   assert.match(pluginSource, /connections\.length > 1/)
 })
