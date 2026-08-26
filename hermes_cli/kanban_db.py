@@ -2512,6 +2512,21 @@ def connect(
                 conn.execute("PRAGMA secure_delete=ON")
                 conn.execute("PRAGMA cell_size_check=ON")
                 schema_present = _schema_is_present(conn)
+                if schema_present:
+                    from hermes_cli.epic_state import (
+                        IntegrityError as EpicIntegrityError,
+                        _validate_schema_contract,
+                    )
+
+                    try:
+                        _validate_schema_contract(conn, allow_missing=False)
+                    except EpicIntegrityError:
+                        # A valid legacy replacement still has the Kanban
+                        # sentinel but not the additive Phase 0 schema. Drop
+                        # the stale fast-path assumption and let the full init
+                        # path add missing objects or reject a conflicting
+                        # contract under the cross-process lock.
+                        schema_present = False
         except Exception:
             conn.close()
             raise

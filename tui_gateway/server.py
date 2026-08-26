@@ -5277,21 +5277,26 @@ def _load_enabled_toolsets(platform: str | None = None) -> list[str] | None:
         cfg = load_config() or {}
         if has_exact_profile_toolset_pin(cfg):
             try:
-                return sorted(
-                    _get_platform_tools(
+                profile_toolsets = _get_platform_tools(
                         cfg,
                         "cli",
                         include_default_mcp_servers=True,
                     )
+                # Profile pins constrain configurable capabilities, but GUI
+                # tools are properties of this session's client surface and
+                # cannot be disabled or enabled by profile config.
+                return sorted(
+                    {*profile_toolsets, *_gui_surface_toolsets(session_platform)}
                 )
             except Exception:
+                surface_toolsets = sorted(_gui_surface_toolsets(session_platform))
                 print(
                     "[tui] exact profile toolset pin could not be resolved; "
-                    "enabling no toolsets",
+                    "enabling only session-scoped GUI toolsets",
                     file=sys.stderr,
                     flush=True,
                 )
-                return []
+                return surface_toolsets
     except Exception:
         cfg = None
 

@@ -630,8 +630,12 @@ def append_receipt(
                 "SELECT body,size,media_type FROM epic_evidence WHERE digest=?", (evidence_digest,)
             ).fetchone()
             if existing:
-                if bytes(existing["body"]) != evidence_bytes or int(existing["size"]) != len(evidence_bytes):
-                    raise IntegrityError("existing evidence bytes do not match digest")
+                if (
+                    bytes(existing["body"]) != evidence_bytes
+                    or int(existing["size"]) != len(evidence_bytes)
+                    or str(existing["media_type"]) != media_type
+                ):
+                    raise IntegrityError("existing evidence bytes or metadata do not match digest")
             else:
                 conn.execute(
                     "INSERT INTO epic_evidence(digest,media_type,size,body,created_at) VALUES(?,?,?,?,?)",

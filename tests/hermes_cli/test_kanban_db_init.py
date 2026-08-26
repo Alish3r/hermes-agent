@@ -440,6 +440,25 @@ def test_connect_reinitializes_schema_when_db_replaced_by_empty_file(tmp_path, m
     assert "tasks" in _tables(db_path)
 
 
+def test_connect_reinitializes_epic_schema_after_legacy_db_replacement(tmp_path, monkeypatch):
+    db_path = _default_board_db(tmp_path, monkeypatch)
+
+    with kb.connect_closing(db_path):
+        pass
+
+    for suffix in ("", "-wal", "-shm"):
+        db_path.with_name(db_path.name + suffix).unlink(missing_ok=True)
+    with sqlite3.connect(str(db_path)) as legacy:
+        legacy.executescript(kb.SCHEMA_SQL)
+    assert "tasks" in _tables(db_path)
+    assert "epic_schema_meta" not in _tables(db_path)
+
+    with kb.connect_closing(db_path) as conn:
+        assert conn.execute(
+            "SELECT schema_version FROM epic_schema_meta WHERE singleton=1"
+        ).fetchone() is not None
+
+
 def test_healthy_fast_path_stays_lock_free(tmp_path, monkeypatch):
     """The self-heal must cost nothing in steady state: an intact cached path
     still skips the cross-process init lock (#36644), and only pays for it when

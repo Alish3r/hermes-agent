@@ -32,12 +32,13 @@ def lease(conn, *, scope="s", owner="a", op="lease-a", expected=0, now=10, expir
 
 def append(conn, *, op="write-1", scope="s", owner="a", token=1,
            payload=None, outcome="success", now=11, evidence=b"proof",
-           evidence_digest=None, reconcile=None, before_commit=None):
+           evidence_digest=None, media_type="application/octet-stream",
+           reconcile=None, before_commit=None):
     return epic_state.append_receipt(
         conn, operation_id=op, scope=scope, operation="record",
         owner=owner, fence_token=token, kind="state", outcome=outcome,
         payload={} if payload is None else payload, evidence_bytes=evidence,
-        evidence_digest=evidence_digest, media_type="application/octet-stream",
+        evidence_digest=evidence_digest, media_type=media_type,
         reconciliation_ref=reconcile, created_at=now, now=now,
         before_commit=before_commit,
     )
@@ -423,6 +424,15 @@ def test_chain_head_anchor_detects_valid_prefix_tail_deletion(tmp_path):
 
     with pytest.raises(epic_state.IntegrityError, match="chain head"):
         epic_state.validate_integrity(conn)
+
+
+def test_evidence_digest_rejects_conflicting_media_type(tmp_path):
+    conn = open_db(tmp_path / "board.db")
+    lease(conn)
+    append(conn, op="text", media_type="text/plain")
+
+    with pytest.raises(epic_state.IntegrityError, match="metadata"):
+        append(conn, op="json", media_type="application/json")
 
 
 def test_cached_connect_does_not_rerun_epic_schema_initialization(tmp_path, monkeypatch):

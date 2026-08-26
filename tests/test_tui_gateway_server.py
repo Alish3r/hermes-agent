@@ -2461,7 +2461,7 @@ def test_load_enabled_toolsets_folds_project_into_focus_posture(monkeypatch):
     assert server._load_enabled_toolsets("tui") == ["coding", "figma", "project"]
 
 
-def test_load_enabled_toolsets_exact_profile_pin_blocks_focus_and_gui_augmentation(monkeypatch):
+def test_load_enabled_toolsets_exact_profile_pin_keeps_session_gui_toolsets(monkeypatch):
     monkeypatch.delenv("HERMES_TUI_TOOLSETS", raising=False)
     import agent.coding_context as cc
     import hermes_cli.config as config_mod
@@ -2473,7 +2473,11 @@ def test_load_enabled_toolsets_exact_profile_pin_blocks_focus_and_gui_augmentati
         lambda: {"tools": {"enabled_toolsets": ["artifact_read"]}},
     )
 
-    assert server._load_enabled_toolsets("desktop") == ["artifact_read"]
+    assert server._load_enabled_toolsets("desktop") == [
+        "artifact_read",
+        "desktop_ui",
+        "project",
+    ]
 
 
 def test_load_enabled_toolsets_preserves_exact_empty_profile_pin(monkeypatch):
@@ -2488,22 +2492,22 @@ def test_load_enabled_toolsets_preserves_exact_empty_profile_pin(monkeypatch):
         lambda: {"tools": {"enabled_toolsets": []}},
     )
 
-    assert server._load_enabled_toolsets("desktop") == []
+    assert server._load_enabled_toolsets("desktop") == ["desktop_ui", "project"]
 
 
 @pytest.mark.parametrize(
     ("pin", "env_value", "profile_mcp", "expected"),
     [
-        (["artifact_read"], "web", None, ["artifact_read"]),
-        (["artifact_read"], "all", None, ["artifact_read"]),
-        (["artifact_read"], "not-a-toolset", None, ["artifact_read"]),
-        (["artifact_read"], "mcp-env", None, ["artifact_read"]),
-        ([], "all", None, []),
-        ([], "web", None, []),
-        ([], "mcp-env", None, []),
-        (["not-a-toolset"], "all", None, []),
-        (["artifact_read"], "all", "mcp-profile", ["artifact_read", "mcp-profile"]),
-        ([], "all", "mcp-profile", ["mcp-profile"]),
+        (["artifact_read"], "web", None, ["artifact_read", "desktop_ui", "project"]),
+        (["artifact_read"], "all", None, ["artifact_read", "desktop_ui", "project"]),
+        (["artifact_read"], "not-a-toolset", None, ["artifact_read", "desktop_ui", "project"]),
+        (["artifact_read"], "mcp-env", None, ["artifact_read", "desktop_ui", "project"]),
+        ([], "all", None, ["desktop_ui", "project"]),
+        ([], "web", None, ["desktop_ui", "project"]),
+        ([], "mcp-env", None, ["desktop_ui", "project"]),
+        (["not-a-toolset"], "all", None, ["desktop_ui", "project"]),
+        (["artifact_read"], "all", "mcp-profile", ["artifact_read", "desktop_ui", "mcp-profile", "project"]),
+        ([], "all", "mcp-profile", ["desktop_ui", "mcp-profile", "project"]),
     ],
 )
 def test_load_enabled_toolsets_exact_profile_pin_outranks_environment_overrides(
