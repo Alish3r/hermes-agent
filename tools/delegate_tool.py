@@ -2787,12 +2787,97 @@ def _run_single_child(
             _worker_thread_holder["t"] = threading.current_thread()
             from agent.delegation_context import delegated_child_context
 
-            with delegated_child_context(str(getattr(child, "session_id", "") or "")):
-                return child.run_conversation(
+            if child is None:
+                raise RuntimeError("subagent construction returned no child")
+            with delegated_child_context(
+                str(getattr(child, "session_id", "") or ""),
+                str(getattr(child, "_delegation_id", "") or "") or None,
+            ):
+                result = child.run_conversation(
                     user_message=goal,
                     task_id=child_task_id,
                     stream_callback=_relay_child_text,
                 )
+                # Runtime finalization barrier for nested orchestrators. A child
+                # that dispatched background grandchildren must stay alive,
+                # consume each completion as a fresh turn, and reach a stable
+                # no-live observation before its result can be terminal. This
+                # is enforced here rather than left to prompt compliance.
+                from tools.async_delegation import (
+                    adjudicate_event,
+                    claim_event_delivery,
+                    complete_event_delivery,
+                    has_live_for_session,
+                    release_event_delivery,
+                )
+                from tools.process_registry import process_registry
+
+                child_session_id = str(getattr(child, "session_id", "") or "")
+
+                def _owns_nested_event(evt: Dict[str, Any]) -> bool:
+                    return (
+                        evt.get("type") == "async_delegation"
+                        and str(evt.get("parent_session_id") or "")
+                        == child_session_id
+                    )
+
+                while child_session_id:
+                    drained = 0
+                    for evt, synthetic_message in process_registry.drain_notifications(
+                        owns_event=_owns_nested_event,
+                    ):
+                        claim = claim_event_delivery(
+                            evt, f"subagent-finalization:{child_session_id}"
+                        )
+                        if claim is None:
+                            continue
+                        try:
+                            result = child.run_conversation(
+                                user_message=synthetic_message,
+                                task_id=child_task_id,
+                                stream_callback=_relay_child_text,
+                            )
+                        except Exception as exc:
+                            release_event_delivery(evt, claim)
+                            adjudicate_event(evt, success=False, error=str(exc))
+                            raise
+                        else:
+                            complete_event_delivery(evt, claim)
+                            adjudicate_event(evt, success=True)
+                            drained += 1
+                    live = has_live_for_session(parent_session_id=child_session_id)
+                    if not live and drained == 0:
+                        # Close the completion race with one second stable
+                        # observation after another ownership-filtered drain.
+                        second = process_registry.drain_notifications(
+                            owns_event=_owns_nested_event,
+                        )
+                        if not second and not has_live_for_session(
+                            parent_session_id=child_session_id
+                        ):
+                            break
+                        for evt, synthetic_message in second:
+                            claim = claim_event_delivery(
+                                evt, f"subagent-finalization:{child_session_id}"
+                            )
+                            if claim is None:
+                                continue
+                            try:
+                                result = child.run_conversation(
+                                    user_message=synthetic_message,
+                                    task_id=child_task_id,
+                                    stream_callback=_relay_child_text,
+                                )
+                            except Exception as exc:
+                                release_event_delivery(evt, claim)
+                                adjudicate_event(evt, success=False, error=str(exc))
+                                raise
+                            else:
+                                complete_event_delivery(evt, claim)
+                                adjudicate_event(evt, success=True)
+                    elif live:
+                        time.sleep(0.1)
+                return result
 
         _child_context = contextvars.copy_context()
         _child_future = _timeout_executor.submit(
@@ -3084,6 +3169,8 @@ def _run_single_child(
             "task_index": task_index,
             "status": status,
             "summary": summary,
+            "child_session_id": str(getattr(child, "session_id", "") or ""),
+            "allocation_id": str(getattr(child, "_delegation_id", "") or ""),
             "api_calls": api_calls,
             "duration_seconds": duration,
             "model": _model if isinstance(_model, str) else None,
@@ -3884,7 +3971,10 @@ def delegate_task(
         # Delegation identity for the live registry + process-notification
         # attribution (child-started background processes report under it).
         if live_deleg_id:
-            setattr(child, "_delegation_id", live_deleg_id)
+            child_allocation_id = (
+                live_deleg_id if n_tasks == 1 else f"{live_deleg_id}_{i}"
+            )
+            setattr(child, "_delegation_id", child_allocation_id)
         children.append((i, t, child))
 
     def _execute_and_aggregate(*, honor_parent_interrupt: bool = True) -> dict:
@@ -4248,6 +4338,7 @@ def delegate_task(
             # parent's toolsets (no model-facing toolsets arg).
             toolsets=None,
             role=top_role,
+            child_roles=[str(t.get("role") or top_role) for t in task_list],
             model=creds["model"],
             session_key=_session_key,
             origin_ui_session_id=_origin_ui_session_id,

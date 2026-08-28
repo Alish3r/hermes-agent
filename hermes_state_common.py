@@ -501,7 +501,55 @@ CREATE TABLE IF NOT EXISTS async_delegations (
     owner_started_at INTEGER,
     task_json TEXT,
     delivery_claim TEXT,
-    delivery_claimed_at REAL
+    delivery_claimed_at REAL,
+    origin_session_id TEXT NOT NULL DEFAULT '',
+    adjudication_state TEXT NOT NULL DEFAULT 'pending',
+    adjudicated_at REAL,
+    adjudication_error TEXT
+);
+
+CREATE TABLE IF NOT EXISTS orchestration_allocations (
+    allocation_id TEXT PRIMARY KEY,
+    root_allocation_id TEXT NOT NULL,
+    parent_allocation_id TEXT,
+    owner_session_id TEXT NOT NULL,
+    launching_session_id TEXT NOT NULL DEFAULT '',
+    role TEXT NOT NULL,
+    depth INTEGER NOT NULL,
+    state TEXT NOT NULL,
+    task_state TEXT NOT NULL DEFAULT 'pending',
+    verdict TEXT,
+    adjudication_state TEXT NOT NULL DEFAULT 'pending',
+    adjudicated_at REAL,
+    adjudication_error TEXT,
+    terminal_reason TEXT,
+    resource_state TEXT NOT NULL DEFAULT 'owned',
+    generation INTEGER NOT NULL,
+    owner_pid INTEGER NOT NULL,
+    owner_started_at INTEGER,
+    resource_claims_json TEXT NOT NULL DEFAULT '{}',
+    terminal_receipt_json TEXT,
+    receipt_digest TEXT,
+    resource_receipt_json TEXT,
+    resource_receipt_digest TEXT,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    FOREIGN KEY(parent_allocation_id)
+        REFERENCES orchestration_allocations(allocation_id)
+);
+
+CREATE TABLE IF NOT EXISTS orchestration_events (
+    event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    allocation_id TEXT NOT NULL,
+    operation_id TEXT NOT NULL UNIQUE,
+    from_state TEXT,
+    to_state TEXT NOT NULL,
+    generation INTEGER NOT NULL,
+    event_json TEXT NOT NULL,
+    event_digest TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    FOREIGN KEY(allocation_id)
+        REFERENCES orchestration_allocations(allocation_id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
@@ -544,6 +592,14 @@ CREATE INDEX IF NOT EXISTS idx_sessions_handoff_state
     ON sessions(handoff_state, started_at);
 CREATE INDEX IF NOT EXISTS idx_sessions_system_prompt_hash
     ON sessions(system_prompt_hash);
+CREATE INDEX IF NOT EXISTS idx_async_delegations_adjudication
+    ON async_delegations(adjudication_state, completed_at);
+CREATE INDEX IF NOT EXISTS idx_orch_parent
+    ON orchestration_allocations(parent_allocation_id);
+CREATE INDEX IF NOT EXISTS idx_orch_root
+    ON orchestration_allocations(root_allocation_id);
+CREATE INDEX IF NOT EXISTS idx_orch_launcher
+    ON orchestration_allocations(launching_session_id);
 """
 
 

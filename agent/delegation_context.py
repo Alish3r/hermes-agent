@@ -22,6 +22,11 @@ _DELEGATED_CHILD_CONTEXT: ContextVar[bool] = ContextVar(
     default=False,
 )
 
+_ORCHESTRATION_ALLOCATION_ID: ContextVar[str] = ContextVar(
+    "hermes_orchestration_allocation_id",
+    default="",
+)
+
 # Set for any in-process execution that is NOT the dispatcher-owned worker even
 # though the worker's HERMES_KANBAN_* vars are legitimately in os.environ (cron
 # jobs fired via the `cronjob` tool).  Kept separate from
@@ -46,14 +51,19 @@ KANBAN_ENV_KEYS: tuple[str, ...] = (
 
 
 @contextmanager
-def delegated_child_context(session_id: str | None = None) -> Iterator[None]:
+def delegated_child_context(
+    session_id: str | None = None,
+    allocation_id: str | None = None,
+) -> Iterator[None]:
     """Mark child execution and isolate its task-local session identity.
 
     Child construction calls ``set_current_session_id`` internally, so even a
-    context entered without an id must restore the parent's ContextVar.  Child
-    execution passes its explicit id and receives it only for this scope.
+    context entered without an id must restore the parent's ContextVar. Child
+    execution also carries its exact allocation id so nested dispatches attach
+    to a canonical parent instead of inferring lineage from titles or timing.
     """
     token = _DELEGATED_CHILD_CONTEXT.set(True)
+    allocation_token = _ORCHESTRATION_ALLOCATION_ID.set(allocation_id or "")
     try:
         # Import lazily: session_context calls is_delegated_child_context() when
         # deciding whether the compatibility os.environ mirror is safe.
@@ -62,12 +72,18 @@ def delegated_child_context(session_id: str | None = None) -> Iterator[None]:
         with scoped_current_session_id(session_id):
             yield
     finally:
+        _ORCHESTRATION_ALLOCATION_ID.reset(allocation_token)
         _DELEGATED_CHILD_CONTEXT.reset(token)
 
 
 def is_delegated_child_context() -> bool:
     """Return True while code is running for a delegate_task child."""
     return bool(_DELEGATED_CHILD_CONTEXT.get())
+
+
+def current_orchestration_allocation_id() -> str:
+    """Return the exact allocation active in this task-local child scope."""
+    return _ORCHESTRATION_ALLOCATION_ID.get()
 
 
 @contextmanager

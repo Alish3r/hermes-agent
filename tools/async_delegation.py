@@ -36,8 +36,10 @@ logic stays in one place.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
+import re
 import sqlite3
 import threading
 import time
@@ -129,6 +131,7 @@ def _connect() -> sqlite3.Connection:
     path = _db_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(path, timeout=10)
+    conn.row_factory = sqlite3.Row
     try:
         _initialize_schema(conn)
     except Exception:
@@ -163,7 +166,10 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
             task_json TEXT,
             delivery_claim TEXT,
             delivery_claimed_at REAL,
-            origin_session_id TEXT NOT NULL DEFAULT ''
+            origin_session_id TEXT NOT NULL DEFAULT '',
+            adjudication_state TEXT NOT NULL DEFAULT 'pending',
+            adjudicated_at REAL,
+            adjudication_error TEXT
         )"""
     )
     columns = {row[1] for row in conn.execute("PRAGMA table_info(async_delegations)")}
@@ -177,7 +183,10 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
         # request — the wake self-post target. Without persisting it,
         # completions recovered after a process restart are unroutable on
         # api_server (the in-memory record that carried it is gone).
-        ("origin_session_id", "TEXT"),
+        ("origin_session_id", "TEXT NOT NULL DEFAULT ''"),
+        ("adjudication_state", "TEXT NOT NULL DEFAULT 'pending'"),
+        ("adjudicated_at", "REAL"),
+        ("adjudication_error", "TEXT"),
     ):
         if name not in columns:
             conn.execute(f"ALTER TABLE async_delegations ADD COLUMN {name} {sql_type}")
@@ -233,8 +242,107 @@ def _capture_routing_origin() -> Dict[str, Any]:
     return origin
 
 
+def _retain_dispatch_allocations(record: Dict[str, Any], reason: str) -> None:
+    """Retain every exact allocation created for a rejected dispatch."""
+    from tools.orchestration_ledger import OrchestrationLedger
+
+    ledger = OrchestrationLedger(_db_path())
+    ids = list(reversed(record.get("child_allocation_ids") or []))
+    ids.append(str(record["delegation_id"]))
+    for allocation_id in ids:
+        try:
+            ledger.retain_dispatch_failure(
+                allocation_id,
+                reason=reason,
+                operation_prefix=(
+                    f"dispatch-failure:{record['delegation_id']}:{allocation_id}"
+                ),
+            )
+        except Exception:
+            logger.exception(
+                "Failed to retain allocation %s after dispatch rejection",
+                allocation_id,
+            )
+
+
+def _mark_dispatch_rejected(record: Dict[str, Any], reason: str) -> None:
+    """Persist an inline rejection without creating a completion notification."""
+    now = time.time()
+    payload = {"status": "rejected", "error": reason}
+    with _DB_LOCK, _transaction() as conn:
+        conn.execute(
+            """UPDATE async_delegations
+                  SET state='rejected', completed_at=?, updated_at=?, result_json=?,
+                      delivery_state='delivered', delivered_at=?,
+                      adjudication_state='adjudicated', adjudicated_at=?
+                WHERE delegation_id=?""",
+            (now, now, json.dumps(payload), now, now, record["delegation_id"]),
+        )
+    from tools.orchestration_ledger import OrchestrationLedger
+
+    OrchestrationLedger(_db_path()).record_adjudication_tree(
+        str(record["delegation_id"]), success=True
+    )
+
+
 def _persist_dispatch(record: Dict[str, Any]) -> None:
     now = time.time()
+    # Canonical allocation lineage is task-local, not inferred from transcripts.
+    # A nested child inherits the exact allocation currently executing in its
+    # ContextVar. Missing parents fail closed instead of silently flattening the
+    # tree.
+    from agent.delegation_context import current_orchestration_allocation_id
+    from tools.orchestration_ledger import OrchestrationLedger
+
+    parent_allocation_id = current_orchestration_allocation_id() or None
+    owner_session_id = str(
+        record.get("parent_session_id")
+        or record.get("session_key")
+        or record.get("origin_ui_session_id")
+        or f"process:{__import__('os').getpid()}"
+    )
+    ledger = OrchestrationLedger(_db_path())
+    allocation = ledger.allocate(
+        allocation_id=str(record["delegation_id"]),
+        owner_session_id=owner_session_id,
+        parent_allocation_id=parent_allocation_id,
+        role=str(record.get("role") or "leaf"),
+        operation_id=f"dispatch:{record['delegation_id']}",
+        resource_claims={
+            "kind": "in_process_subagent",
+            "owner_pid": __import__("os").getpid(),
+        },
+    )
+    record["allocation_id"] = allocation["allocation_id"]
+    record["root_allocation_id"] = allocation["root_allocation_id"]
+    record["parent_allocation_id"] = allocation["parent_allocation_id"]
+    if record.get("is_batch"):
+        raw_tasks = record.get("goals")
+        tasks: list[Any] = raw_tasks if isinstance(raw_tasks, list) else []
+        raw_roles = record.get("child_roles")
+        child_roles: list[Any] = raw_roles if isinstance(raw_roles, list) else []
+        child_allocation_ids = []
+        for index, task in enumerate(tasks):
+            child_id = f"{record['delegation_id']}_{index}"
+            child_role = (
+                str(child_roles[index])
+                if index < len(child_roles) and child_roles[index]
+                else str(record.get("role") or "leaf")
+            )
+            child = ledger.allocate(
+                allocation_id=child_id,
+                owner_session_id=f"pending:{child_id}",
+                parent_allocation_id=allocation["allocation_id"],
+                launching_session_id=owner_session_id,
+                role=child_role,
+                operation_id=f"dispatch:{child_id}",
+                resource_claims={
+                    "kind": "in_process_subagent",
+                    "owner_pid": __import__("os").getpid(),
+                },
+            )
+            child_allocation_ids.append(child["allocation_id"])
+        record["child_allocation_ids"] = child_allocation_ids
     try:
         from gateway.status import get_process_start_time
         owner_started_at = get_process_start_time(__import__("os").getpid())
@@ -243,7 +351,9 @@ def _persist_dispatch(record: Dict[str, Any]) -> None:
     task_payload = {
         key: record.get(key)
         for key in (
-            "goal", "goals", "context", "toolsets", "role", "model", "is_batch",
+            "goal", "goals", "context", "toolsets", "role", "child_roles",
+            "model", "is_batch",
+            "allocation_id", "root_allocation_id", "parent_allocation_id",
             # Routing origin (scope_id/user_id/user_name): persisted so a
             # restart-recovered completion can reconstruct a full
             # SessionSource — see _capture_routing_origin.
@@ -251,26 +361,28 @@ def _persist_dispatch(record: Dict[str, Any]) -> None:
         )
         if key in record
     }
-    with _DB_LOCK, _transaction() as conn:
-        conn.execute(
-            """INSERT OR REPLACE INTO async_delegations
-               (delegation_id, origin_session, origin_ui_session_id,
-                parent_session_id, state, dispatched_at, updated_at,
-                delivery_state, delivery_attempts, owner_pid,
-                owner_started_at, task_json, origin_session_id)
-               VALUES (?, ?, ?, ?, 'running', ?, ?, 'pending', 0, ?, ?, ?, ?)""",
-            (record["delegation_id"], record.get("session_key", ""),
-             record.get("origin_ui_session_id", ""), record.get("parent_session_id"),
-             record["dispatched_at"], now, __import__("os").getpid(),
-             owner_started_at, json.dumps(task_payload),
-             record.get("origin_session_id", "")),
-        )
+    try:
+        with _DB_LOCK, _transaction() as conn:
+            conn.execute(
+                """INSERT INTO async_delegations
+                   (delegation_id, origin_session, origin_ui_session_id,
+                    parent_session_id, state, dispatched_at, updated_at,
+                    delivery_state, delivery_attempts, owner_pid,
+                    owner_started_at, task_json, origin_session_id)
+                   VALUES (?, ?, ?, ?, 'running', ?, ?, 'pending', 0, ?, ?, ?, ?)""",
+                (record["delegation_id"], record.get("session_key", ""),
+                 record.get("origin_ui_session_id", ""), record.get("parent_session_id"),
+                 record["dispatched_at"], now, __import__("os").getpid(),
+                 owner_started_at, json.dumps(task_payload),
+                 record.get("origin_session_id", "")),
+            )
+    except Exception as exc:
+        # The lifecycle allocation is written first so lineage can fail closed.
+        # If the transport journal then rejects persistence, retain every newly
+        # allocated unit instead of leaving a ghost-live descendant.
+        _retain_dispatch_allocations(record, f"{type(exc).__name__}: {exc}")
+        raise
     _prune_durable_records()
-
-
-def _delete_durable_delegation(delegation_id: str) -> None:
-    with _DB_LOCK, _transaction() as conn:
-        conn.execute("DELETE FROM async_delegations WHERE delegation_id=?", (delegation_id,))
 
 
 def _prune_durable_records() -> None:
@@ -313,14 +425,129 @@ def _prune_durable_records() -> None:
 
 
 def _persist_completion(event: Dict[str, Any], result: Dict[str, Any]) -> None:
+    """Persist transport evidence once, then converge the lifecycle oracle."""
     now = time.time()
     with _DB_LOCK, _transaction() as conn:
+        row = conn.execute(
+            "SELECT state, event_json, result_json FROM async_delegations WHERE delegation_id=?",
+            (event["delegation_id"],),
+        ).fetchone()
+        if row is None:
+            raise RuntimeError(
+                f"completion has no durable dispatch: {event['delegation_id']}"
+            )
+        if str(row["state"]) not in {"running", "stalling", "finalizing"}:
+            previous = json.loads(row["result_json"] or "null")
+            if json.dumps(previous, sort_keys=True, default=str) != json.dumps(
+                result, sort_keys=True, default=str
+            ):
+                raise RuntimeError(
+                    f"conflicting duplicate completion: {event['delegation_id']}"
+                )
+            persisted_event = json.loads(row["event_json"] or "{}")
+            if isinstance(persisted_event, dict):
+                event.update(persisted_event)
+        else:
+            conn.execute(
+                """UPDATE async_delegations SET state=?, completed_at=?, updated_at=?,
+                   event_json=?, result_json=?, delivery_state='pending'
+                   WHERE delegation_id=?""",
+                (event.get("status", "completed"), event.get("completed_at", now), now,
+                 json.dumps(event), json.dumps(result), event["delegation_id"]),
+            )
+    _converge_ledger_completion(event, result)
+
+
+def _converge_ledger_completion(event: Dict[str, Any], result: Dict[str, Any]) -> None:
+    """Apply terminal transport evidence to the canonical allocation ledger."""
+    now = time.time()
+    # The transport row is durable attempted-work evidence. The allocation
+    # receipt below is the sole lifecycle oracle and can fail closed if a
+    # parent tries to finish while descendants remain active/unreconciled.
+    from tools.orchestration_ledger import OrchestrationLedger
+
+    ledger = OrchestrationLedger(_db_path())
+
+    def _finalize_one(
+        allocation_id: str,
+        child_result: Dict[str, Any],
+        status: str,
+    ) -> dict[str, Any]:
+        allocation = ledger.get(allocation_id)
+        success = status in {"completed", "success"}
+        receipt_result = {
+            "summary": child_result.get("summary"),
+            "error": child_result.get("error"),
+            "child_session_id": child_result.get("child_session_id"),
+            "allocation_id": allocation_id,
+            "result_digest": hashlib.sha256(
+                json.dumps(child_result, sort_keys=True, default=str).encode("utf-8")
+            ).hexdigest(),
+        }
+        terminal = ledger.record_terminal_receipt(
+            allocation_id,
+            expected_generation=int(allocation["generation"]),
+            operation_id=f"terminal:{allocation_id}",
+            task_state="complete" if success else "failed",
+            verdict=(
+                str(child_result.get("verdict"))
+                if child_result.get("verdict") is not None
+                else None
+            ),
+            terminal_reason="normal" if success else (status or "error"),
+            result=receipt_result,
+        )
+        if success:
+            terminal = ledger.mark_resource_reaped(
+                allocation_id,
+                expected_generation=int(terminal["generation"]),
+                operation_id=f"reap:{allocation_id}",
+                resource_receipt={
+                    "kind": "in_process_subagent",
+                    "verified_absent": True,
+                    "runner_returned": True,
+                    "recorded_at": now,
+                },
+            )
+        return terminal
+
+    batch_results = result.get("results")
+    if event.get("is_batch") and isinstance(batch_results, list):
+        for index, child_result in enumerate(batch_results):
+            if not isinstance(child_result, dict):
+                child_result = {"status": "error", "error": "malformed child result"}
+            child_id = str(
+                child_result.get("allocation_id")
+                or f"{event['delegation_id']}_{index}"
+            )
+            _finalize_one(
+                child_id,
+                child_result,
+                str(child_result.get("status") or "error"),
+            )
+
+    allocation_id = str(event.get("allocation_id") or event["delegation_id"])
+    terminal = _finalize_one(
+        allocation_id,
+        result,
+        str(event.get("status") or "error"),
+    )
+    event["allocation_id"] = allocation_id
+    event["root_allocation_id"] = terminal["root_allocation_id"]
+    event["parent_allocation_id"] = terminal["parent_allocation_id"]
+    event["task_state"] = terminal["task_state"]
+    event["verdict"] = terminal["verdict"]
+    event["receipt_digest"] = terminal["receipt_digest"]
+    event["resource_state"] = terminal["resource_state"]
+    event["resource_receipt_digest"] = terminal["resource_receipt_digest"]
+
+    # Persist the enriched receipt-backed event only after every lifecycle
+    # mutation above succeeds. The earlier write remains attempted-work evidence
+    # if this stronger phase fails closed.
+    with _DB_LOCK, _transaction() as conn:
         conn.execute(
-            """UPDATE async_delegations SET state=?, completed_at=?, updated_at=?,
-               event_json=?, result_json=?, delivery_state='pending'
-               WHERE delegation_id=?""",
-            (event.get("status", "completed"), event.get("completed_at", now), now,
-             json.dumps(event), json.dumps(result), event["delegation_id"]),
+            "UPDATE async_delegations SET event_json=?, updated_at=? WHERE delegation_id=?",
+            (json.dumps(event), time.time(), event["delegation_id"]),
         )
 
 
@@ -386,6 +613,42 @@ def recover_abandoned_delegations() -> int:
                 (now, now, json.dumps(event), json.dumps(result), delegation_id),
             )
             recovered += 1
+
+    # A crash can occur after transport evidence commits but before lifecycle
+    # receipts do. Reapply every terminal payload idempotently, then fence any
+    # remaining live allocations whose exact owner identity disappeared (batch
+    # children included). Legacy rows without allocations remain replayable
+    # transport evidence and are intentionally ignored by the control plane.
+    with _DB_LOCK, _transaction() as conn:
+        terminal_rows = conn.execute(
+            """SELECT delegation_id, event_json, result_json,
+                      adjudication_state, adjudication_error
+                 FROM async_delegations
+                 WHERE state NOT IN ('running','stalling','finalizing')
+                   AND event_json IS NOT NULL AND result_json IS NOT NULL"""
+        ).fetchall()
+    for delegation_id, event_json, result_json, adjudication_state, adjudication_error in terminal_rows:
+        try:
+            event = json.loads(event_json)
+            result = json.loads(result_json)
+            if isinstance(event, dict) and isinstance(result, dict):
+                _converge_ledger_completion(event, result)
+            if adjudication_state in {"adjudicated", "failed"}:
+                from tools.orchestration_ledger import OrchestrationLedger
+
+                OrchestrationLedger(_db_path()).record_adjudication_tree(
+                    str(delegation_id),
+                    success=adjudication_state == "adjudicated",
+                    error=str(adjudication_error or ""),
+                )
+        except Exception as exc:
+            logger.warning("Lifecycle convergence deferred: %s", exc)
+    try:
+        from tools.orchestration_ledger import OrchestrationLedger
+
+        OrchestrationLedger(_db_path()).recover_stale_owners()
+    except Exception as exc:
+        logger.warning("Stale allocation recovery deferred: %s", exc)
     return recovered
 
 
@@ -570,12 +833,67 @@ def release_event_delivery(evt: Dict[str, Any], claim_id: str) -> None:
         release_completion_delivery(str(evt.get("delegation_id") or ""), claim_id)
 
 
+def mark_completion_adjudicated(
+    delegation_id: str,
+    *,
+    success: bool,
+    error: str = "",
+) -> bool:
+    """Record that the owning agent processed the delivered result as a turn."""
+    if not delegation_id:
+        return False
+    now = time.time()
+    state = "adjudicated" if success else "failed"
+    with _DB_LOCK, _transaction() as conn:
+        cur = conn.execute(
+            """UPDATE async_delegations
+                  SET adjudication_state=?, adjudicated_at=?,
+                      adjudication_error=?, updated_at=?
+                WHERE delegation_id=?
+                  AND state NOT IN ('running','stalling','finalizing')
+                  AND adjudication_state!='adjudicated'""",
+            (state, now, (error or "")[:2000] or None, now, delegation_id),
+        )
+        updated = cur.rowcount == 1
+    if updated:
+        from tools.orchestration_ledger import OrchestrationLedger
+
+        OrchestrationLedger(_db_path()).record_adjudication_tree(
+            delegation_id, success=success, error=error
+        )
+    return updated
+
+
+def adjudicate_event(evt: Dict[str, Any], *, success: bool, error: str = "") -> None:
+    if evt.get("type") == "async_delegation":
+        mark_completion_adjudicated(
+            str(evt.get("delegation_id") or ""), success=success, error=error
+        )
+
+
+def adjudicate_completion_message(
+    message: str,
+    *,
+    success: bool,
+    error: str = "",
+) -> bool:
+    """Adjudicate a synthetic completion turn by its immutable header id."""
+    match = re.search(
+        r"\[ASYNC DELEGATION(?: BATCH)? COMPLETE — (deleg_[A-Za-z0-9]+)\]",
+        message or "",
+    )
+    if not match:
+        return False
+    return mark_completion_adjudicated(match.group(1), success=success, error=error)
+
+
 def get_durable_delegation(delegation_id: str) -> Optional[Dict[str, Any]]:
     with _DB_LOCK, _transaction() as conn:
         row = conn.execute(
             """SELECT origin_session, state, dispatched_at, completed_at,
                       result_json, delivery_state, delivery_attempts,
-                      origin_session_id
+                      origin_session_id, adjudication_state, adjudicated_at,
+                      adjudication_error
                FROM async_delegations WHERE delegation_id=?""", (delegation_id,),
         ).fetchone()
     if row is None:
@@ -586,6 +904,9 @@ def get_durable_delegation(delegation_id: str) -> Optional[Dict[str, Any]]:
         "result": json.loads(row[4]) if row[4] else None,
         "delivery_state": row[5], "delivery_attempts": row[6],
         "origin_session_id": row[7] or "",
+        "adjudication_state": row[8] or "pending",
+        "adjudicated_at": row[9],
+        "adjudication_error": row[10] or "",
     }
 
 
@@ -668,7 +989,8 @@ def _matches_session_selectors(
     origin_ui_session_id: str = "",
     parent_session_id: str = "",
 ) -> bool:
-    return (
+    """Match local runner records for best-effort interruption only."""
+    return bool(
         (origin_ui_session_id and str(record.get("origin_ui_session_id") or "") == origin_ui_session_id)
         or (session_key and str(record.get("session_key") or "") == session_key)
         or (parent_session_id and str(record.get("parent_session_id") or "") == parent_session_id)
@@ -680,24 +1002,32 @@ def has_live_for_session(
     origin_ui_session_id: str = "",
     parent_session_id: str = "",
 ) -> bool:
-    """Whether a session still owns any live async delegation.
+    """Whether exact durable session identity owns a live allocation.
 
-    Live = running / stalling / finalizing — the same states the reapers'
-    keepalive treats as active work.
+    The canonical allocation ledger is the only lifecycle oracle.  The async
+    registry is a transport journal and may legitimately lag or be pruned, so
+    neither its SQLite rows nor its in-memory records may authorize or block
+    finalization.  A ledger error fails closed because missing canonical
+    evidence is never permission to exit.
     """
     if not session_key and not origin_ui_session_id and not parent_session_id:
         return False
-    with _records_lock:
+    owner_session_ids = {
+        value
+        for value in (session_key, origin_ui_session_id, parent_session_id)
+        if value
+    }
+    try:
+        from tools.orchestration_ledger import OrchestrationLedger
+
+        ledger = OrchestrationLedger(_db_path())
         return any(
-            r.get("status") in {"running", "stalling", "finalizing"}
-            and _matches_session_selectors(
-                r,
-                session_key=session_key,
-                origin_ui_session_id=origin_ui_session_id,
-                parent_session_id=parent_session_id,
-            )
-            for r in _records.values()
+            ledger.find_live_by_launching_session(owner_session_id) is not None
+            for owner_session_id in owner_session_ids
         )
+    except Exception:
+        logger.exception("Canonical allocation collector failed; blocking finalization")
+        return True
 
 
 def _new_delegation_id() -> str:
@@ -853,7 +1183,16 @@ def dispatch_async_delegation(
             }
         _records[delegation_id] = record
 
-    _persist_dispatch(record)
+    try:
+        _persist_dispatch(record)
+    except Exception as exc:
+        with _records_lock:
+            _records.pop(delegation_id, None)
+        logger.error("Async delegation %s allocation refused: %s", delegation_id, exc)
+        return {
+            "status": "rejected",
+            "error": f"Orchestration allocation could not be persisted: {exc}",
+        }
     executor = _get_executor(max_async_children)
 
     def _worker() -> None:
@@ -882,10 +1221,12 @@ def dispatch_async_delegation(
     except Exception as exc:  # pragma: no cover — pool submit failure is rare
         with _records_lock:
             _records.pop(delegation_id, None)
-        _delete_durable_delegation(delegation_id)
+        reason = f"Failed to schedule async delegation: {exc}"
+        _retain_dispatch_allocations(record, reason)
+        _mark_dispatch_rejected(record, reason)
         return {
             "status": "rejected",
-            "error": f"Failed to schedule async delegation: {exc}",
+            "error": reason,
         }
     if progress_fn is not None:
         _ensure_stale_monitor()
@@ -940,21 +1281,12 @@ def _finish_finalization(delegation_id: str, status: str) -> None:
 def _push_completion_event(
     record: Dict[str, Any], result: Dict[str, Any], status: str
 ) -> None:
-    """Push a type='async_delegation' event onto the shared completion queue.
+    """Persist then publish a type='async_delegation' completion event.
 
-    Best-effort: a failure here must not crash the worker, but it WOULD mean a
-    silently-lost result, so we log loudly.
+    Durability is authoritative: queue publication is attempted only after the
+    terminal receipt commits. If the registry is unavailable, restart recovery
+    can still replay the pending durable event.
     """
-    try:
-        from tools.process_registry import process_registry
-    except Exception as exc:  # pragma: no cover
-        logger.error(
-            "Async delegation %s finished but process_registry import failed; "
-            "result lost: %s",
-            record.get("delegation_id"), exc,
-        )
-        return
-
     summary = result.get("summary")
     error = result.get("error")
     dispatched_at = record.get("dispatched_at") or time.time()
@@ -969,6 +1301,9 @@ def _push_completion_event(
         "origin_ui_session_id": record.get("origin_ui_session_id", ""),
         "origin_session_id": record.get("origin_session_id", ""),
         "parent_session_id": record.get("parent_session_id"),
+        "allocation_id": record.get("allocation_id") or record.get("delegation_id"),
+        "root_allocation_id": record.get("root_allocation_id"),
+        "parent_allocation_id": record.get("parent_allocation_id"),
         "goal": record.get("goal", ""),
         "context": record.get("context"),
         "toolsets": record.get("toolsets"),
@@ -1003,11 +1338,13 @@ def _push_completion_event(
             evt[_k] = result[_k]
     _persist_completion(evt, result)
     try:
+        from tools.process_registry import process_registry
+
         process_registry.completion_queue.put(evt)
     except Exception as exc:  # pragma: no cover
         logger.error(
-            "Async delegation %s: failed to enqueue completion event; "
-            "result lost: %s",
+            "Async delegation %s: durable result committed but immediate queue "
+            "publication failed; restart recovery will retry: %s",
             record.get("delegation_id"), exc,
         )
 
@@ -1028,6 +1365,7 @@ def dispatch_async_delegation_batch(
     max_async_children: int = _DEFAULT_MAX_ASYNC_CHILDREN,
     delegation_id: Optional[str] = None,
     progress_fn: Optional[Callable[[], tuple]] = None,
+    child_roles: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """Dispatch a WHOLE fan-out batch as ONE background unit.
 
@@ -1063,6 +1401,7 @@ def dispatch_async_delegation_batch(
         "context": context,
         "toolsets": list(toolsets) if toolsets else None,
         "role": role,
+        "child_roles": list(child_roles) if child_roles else None,
         "model": model,
         "session_key": session_key,
         "origin_ui_session_id": origin_ui_session_id,
@@ -1096,7 +1435,16 @@ def dispatch_async_delegation_batch(
             }
         _records[delegation_id] = record
 
-    _persist_dispatch(record)
+    try:
+        _persist_dispatch(record)
+    except Exception as exc:
+        with _records_lock:
+            _records.pop(delegation_id, None)
+        logger.error("Async delegation %s allocation refused: %s", delegation_id, exc)
+        return {
+            "status": "rejected",
+            "error": f"Orchestration allocation could not be persisted: {exc}",
+        }
     executor = _get_executor(max_async_children)
 
     def _worker() -> None:
@@ -1130,10 +1478,12 @@ def dispatch_async_delegation_batch(
     except Exception as exc:  # pragma: no cover
         with _records_lock:
             _records.pop(delegation_id, None)
-        _delete_durable_delegation(delegation_id)
+        reason = f"Failed to schedule async delegation batch: {exc}"
+        _retain_dispatch_allocations(record, reason)
+        _mark_dispatch_rejected(record, reason)
         return {
             "status": "rejected",
-            "error": f"Failed to schedule async delegation batch: {exc}",
+            "error": reason,
         }
     if progress_fn is not None:
         _ensure_stale_monitor()
@@ -1161,17 +1511,7 @@ def _finalize_batch(
 def _push_batch_completion_event(
     event_record: Dict[str, Any], combined: Dict[str, Any], status: str
 ) -> None:
-    """Push a combined async-delegation batch completion event."""
-    try:
-        from tools.process_registry import process_registry
-    except Exception as exc:  # pragma: no cover
-        logger.error(
-            "Async delegation batch %s finished but process_registry import "
-            "failed; result lost: %s",
-            event_record.get("delegation_id"), exc,
-        )
-        return
-
+    """Persist then publish one combined async-delegation completion."""
     dispatched_at = event_record.get("dispatched_at") or time.time()
     completed_at = event_record.get("completed_at") or time.time()
     evt = {
@@ -1181,6 +1521,9 @@ def _push_batch_completion_event(
         "origin_ui_session_id": event_record.get("origin_ui_session_id", ""),
         "origin_session_id": event_record.get("origin_session_id", ""),
         "parent_session_id": event_record.get("parent_session_id"),
+        "allocation_id": event_record.get("allocation_id") or event_record.get("delegation_id"),
+        "root_allocation_id": event_record.get("root_allocation_id"),
+        "parent_allocation_id": event_record.get("parent_allocation_id"),
         "goal": event_record.get("goal", ""),
         "goals": event_record.get("goals"),
         "context": event_record.get("context"),
@@ -1217,11 +1560,13 @@ def _push_batch_completion_event(
             evt[_k] = combined[_k]
     _persist_completion(evt, combined)
     try:
+        from tools.process_registry import process_registry
+
         process_registry.completion_queue.put(evt)
     except Exception as exc:  # pragma: no cover
         logger.error(
-            "Async delegation batch %s: failed to enqueue completion event; "
-            "result lost: %s",
+            "Async delegation batch %s: durable result committed but immediate "
+            "queue publication failed; restart recovery will retry: %s",
             event_record.get("delegation_id"), exc,
         )
 

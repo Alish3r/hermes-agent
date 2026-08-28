@@ -1068,6 +1068,71 @@ class TestChildCredentialLeasing(unittest.TestCase):
         child._swap_credential.assert_called_once_with(leased_entry)
         child._credential_pool.release_lease.assert_called_once_with("cred-b")
 
+    def test_run_single_child_drains_nested_async_results_before_return(self):
+        """An orchestrator child cannot finalize while a grandchild is live."""
+        from tools.delegate_tool import _run_single_child
+        from tools.process_registry import process_registry
+
+        while not process_registry.completion_queue.empty():
+            process_registry.completion_queue.get_nowait()
+
+        child = MagicMock()
+        child.session_id = "nested-parent-session"
+        child._delegation_id = "deleg_parent"
+        child._credential_pool = None
+        child.run_conversation.side_effect = [
+            {
+                "final_response": "grandchild dispatched",
+                "completed": True,
+                "api_calls": 1,
+                "messages": [],
+            },
+            {
+                "final_response": "grandchild adjudicated",
+                "completed": True,
+                "api_calls": 2,
+                "messages": [],
+            },
+        ]
+        process_registry.completion_queue.put(
+            {
+                "type": "async_delegation",
+                "delegation_id": "deleg_grandchild",
+                "parent_session_id": "nested-parent-session",
+                "status": "completed",
+                "summary": "grandchild result",
+                "goal": "nested work",
+                "dispatched_at": time.time() - 1,
+                "completed_at": time.time(),
+            }
+        )
+        live = iter([True, False, False])
+        with patch(
+            "tools.async_delegation.has_live_for_session",
+            side_effect=lambda **_kwargs: next(live),
+        ), patch(
+            "tools.async_delegation.claim_event_delivery", return_value="claim"
+        ), patch(
+            "tools.async_delegation.complete_event_delivery"
+        ) as complete, patch(
+            "tools.async_delegation.release_event_delivery"
+        ):
+            result = _run_single_child(
+                task_index=0,
+                goal="orchestrate nested work",
+                child=child,
+                parent_agent=_make_mock_parent(),
+            )
+
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["summary"], "grandchild adjudicated")
+        self.assertEqual(child.run_conversation.call_count, 2)
+        self.assertIn(
+            "ASYNC DELEGATION COMPLETE",
+            child.run_conversation.call_args_list[1].kwargs["user_message"],
+        )
+        complete.assert_called_once()
+
     def test_run_single_child_releases_lease_after_failure(self):
         from tools.delegate_tool import _run_single_child
 
@@ -1947,6 +2012,156 @@ class TestFallbackModelInheritance(unittest.TestCase):
                 with self.assertRaises(ValueError) as ctx:
                     _resolve_delegation_credentials(cfg, parent)
         self.assertIn("missing-acp-binary", str(ctx.exception))
+
+
+def test_disposable_root_orchestrator_grandchild_recursive_reap(monkeypatch, tmp_path):
+    """Real async dispatch drains a grandchild and preserves an unrelated allocation."""
+    from agent.delegation_context import delegated_child_context
+    from tools import async_delegation as ad
+    from tools.delegate_tool import _run_single_child
+    from tools.orchestration_ledger import OrchestrationLedger
+    from tools.process_registry import process_registry
+
+    db_path = tmp_path / "state.db"
+    monkeypatch.setattr(ad, "_db_path", lambda: db_path)
+    ad._reset_for_tests()
+    while not process_registry.completion_queue.empty():
+        process_registry.completion_queue.get_nowait()
+
+    ledger = OrchestrationLedger(db_path)
+    root = ledger.allocate(
+        allocation_id="deleg_integration_root",
+        owner_session_id="integration-root-session",
+        role="orchestrator",
+        operation_id="launch-integration-root",
+    )
+    unrelated = ledger.allocate(
+        allocation_id="deleg_integration_unrelated",
+        owner_session_id="unrelated-session",
+        role="leaf",
+        operation_id="launch-integration-unrelated",
+    )
+
+    child = MagicMock()
+    child.session_id = "integration-child-session"
+    child._credential_pool = None
+    child._delegate_role = "orchestrator"
+    child.session_prompt_tokens = 0
+    child.session_completion_tokens = 0
+    child.session_estimated_cost_usd = 0.0
+    child.session_cost_status = "available"
+    child.model = "test-model"
+    conversation_calls = 0
+    grandchild_id = ""
+
+    def run_conversation(**_kwargs):
+        nonlocal conversation_calls, grandchild_id
+        conversation_calls += 1
+        if conversation_calls == 1:
+            grandchild = ad.dispatch_async_delegation(
+                goal="disposable grandchild",
+                context=None,
+                toolsets=None,
+                role="leaf",
+                model="test-model",
+                session_key=child.session_id,
+                parent_session_id=child.session_id,
+                runner=lambda: {
+                    "status": "completed",
+                    "summary": "grandchild complete",
+                    "child_session_id": "integration-grandchild-session",
+                    "api_calls": 1,
+                },
+                max_async_children=2,
+            )
+            assert grandchild["status"] == "dispatched"
+            grandchild_id = grandchild["delegation_id"]
+            return {
+                "final_response": "grandchild dispatched",
+                "completed": True,
+                "api_calls": 1,
+                "messages": [],
+            }
+        return {
+            "final_response": "grandchild adjudicated",
+            "completed": True,
+            "api_calls": 2,
+            "messages": [],
+        }
+
+    child.run_conversation.side_effect = run_conversation
+    allow_runner = threading.Event()
+
+    def child_runner():
+        assert allow_runner.wait(timeout=5)
+        return _run_single_child(
+            task_index=0,
+            goal="disposable child orchestrator",
+            child=child,
+            parent_agent=_make_mock_parent(),
+        )
+
+    with delegated_child_context("integration-root-session", root["allocation_id"]):
+        dispatched = ad.dispatch_async_delegation(
+            goal="disposable child orchestrator",
+            context=None,
+            toolsets=None,
+            role="orchestrator",
+            model="test-model",
+            session_key="integration-root-session",
+            parent_session_id="integration-root-session",
+            runner=child_runner,
+            max_async_children=2,
+        )
+    assert dispatched["status"] == "dispatched"
+    child._delegation_id = dispatched["delegation_id"]
+    allow_runner.set()
+
+    deadline = time.monotonic() + 10
+    child_event = None
+    while time.monotonic() < deadline:
+        for event in process_registry.drain_notifications(
+            owns_event=lambda item: item.get("delegation_id") == dispatched["delegation_id"]
+        ):
+            child_event = event[0]
+        if child_event is not None:
+            break
+        time.sleep(0.01)
+    assert child_event is not None, {
+        "records": [
+            (item.get("delegation_id"), item.get("status"), item.get("error"))
+            for item in ad.list_async_delegations()
+        ],
+        "descendants": [
+            (item["allocation_id"], item["state"], item["resource_state"], item["terminal_reason"])
+            for item in ledger.descendants(root["allocation_id"])
+        ],
+        "conversation_calls": conversation_calls,
+    }
+    assert conversation_calls == 2
+    assert ledger.get(grandchild_id)["state"] == "reaped"
+    assert ledger.get(dispatched["delegation_id"])["state"] == "reaped"
+    assert ledger.finalization_gate(root["allocation_id"])["allowed"] is True
+
+    root_terminal = ledger.record_terminal_receipt(
+        root["allocation_id"],
+        expected_generation=root["generation"],
+        operation_id="terminal-integration-root",
+        task_state="complete",
+        verdict="GO",
+        terminal_reason="normal",
+        result={"summary": "recursive tree drained"},
+    )
+    ledger.mark_resource_reaped(
+        root["allocation_id"],
+        expected_generation=root_terminal["generation"],
+        operation_id="reap-integration-root",
+        resource_receipt={"kind": "test-root", "verified_absent": True},
+    )
+    survivor = ledger.get(unrelated["allocation_id"])
+    assert survivor["state"] == "running"
+    assert survivor["generation"] == unrelated["generation"]
+    ad._reset_for_tests()
 
 
 if __name__ == "__main__":

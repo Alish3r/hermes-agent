@@ -8,6 +8,7 @@ formatting, capacity rejection, and crash handling.
 import json
 import os
 import queue
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -173,6 +174,368 @@ def test_completion_event_lands_on_shared_queue_with_session_key():
     assert evt["session_key"] == "agent:main:cli:dm:local"
     assert evt["parent_session_id"] == "20260703_parent_sid"
     assert evt["delegation_id"] == res["delegation_id"]
+
+
+def test_dispatch_and_completion_write_canonical_reaped_allocation(monkeypatch, tmp_path):
+    db_path = tmp_path / "state.db"
+    monkeypatch.setattr(ad, "_db_path", lambda: db_path)
+
+    res = ad.dispatch_async_delegation(
+        goal="canonical lifecycle",
+        context=None,
+        toolsets=None,
+        role="leaf",
+        model="test-model",
+        session_key="parent-session",
+        parent_session_id="parent-session",
+        runner=lambda: {
+            "status": "completed",
+            "summary": "receipt-backed result",
+            "verdict": "GO",
+            "api_calls": 1,
+        },
+        max_async_children=1,
+    )
+    evt = _drain_for(res["delegation_id"])
+    assert evt is not None
+    assert evt["allocation_id"] == res["delegation_id"]
+    assert evt["root_allocation_id"] == res["delegation_id"]
+    assert evt["parent_allocation_id"] is None
+    assert evt["task_state"] == "complete"
+    assert evt["verdict"] == "GO"
+    assert evt["resource_state"] == "reaped"
+    assert evt["receipt_digest"]
+
+    from tools.orchestration_ledger import OrchestrationLedger
+
+    row = OrchestrationLedger(db_path).get(res["delegation_id"])
+    assert row["state"] == "reaped"
+    assert row["task_state"] == "complete"
+    assert row["verdict"] == "GO"
+    assert row["resource_receipt_digest"]
+
+
+def test_queue_publication_failure_keeps_durable_terminal_receipt(monkeypatch, tmp_path):
+    db_path = tmp_path / "state.db"
+    monkeypatch.setattr(ad, "_db_path", lambda: db_path)
+    record = {
+        "delegation_id": "deleg_queue_failure",
+        "goal": "durability probe",
+        "context": None,
+        "toolsets": None,
+        "role": "leaf",
+        "model": "test-model",
+        "session_key": "parent",
+        "origin_ui_session_id": "",
+        "origin_session_id": "",
+        "parent_session_id": "parent",
+        "status": "running",
+        "dispatched_at": time.time() - 1,
+        "completed_at": time.time(),
+    }
+    ad._persist_dispatch(record)
+    monkeypatch.setattr(
+        process_registry.completion_queue,
+        "put",
+        lambda _event: (_ for _ in ()).throw(RuntimeError("queue unavailable")),
+    )
+
+    ad._push_completion_event(
+        record,
+        {"status": "completed", "summary": "durably complete", "api_calls": 1},
+        "completed",
+    )
+
+    with sqlite3.connect(db_path) as con:
+        state, delivery_state, event_json = con.execute(
+            "SELECT state, delivery_state, event_json FROM async_delegations "
+            "WHERE delegation_id='deleg_queue_failure'"
+        ).fetchone()
+    assert state == "completed"
+    assert delivery_state == "pending"
+    assert json.loads(event_json)["receipt_digest"]
+
+    from tools.orchestration_ledger import OrchestrationLedger
+
+    assert OrchestrationLedger(db_path).get("deleg_queue_failure")["state"] == "reaped"
+
+
+def test_executor_submit_failure_retains_batch_allocations(monkeypatch, tmp_path):
+    db_path = tmp_path / "state.db"
+    monkeypatch.setattr(ad, "_db_path", lambda: db_path)
+
+    class BrokenExecutor:
+        def submit(self, *_args, **_kwargs):
+            raise RuntimeError("executor unavailable")
+
+    monkeypatch.setattr(ad, "_get_executor", lambda _workers: BrokenExecutor())
+    monkeypatch.setattr(ad, "_new_delegation_id", lambda: "deleg_submit_failure")
+    result = ad.dispatch_async_delegation_batch(
+        goals=["one", "two"],
+        context=None,
+        toolsets=None,
+        role="leaf",
+        model=None,
+        session_key="parent",
+        parent_session_id="parent",
+        runner=lambda: {"status": "completed"},
+        max_async_children=2,
+    )
+    assert result["status"] == "rejected"
+
+    from tools.orchestration_ledger import OrchestrationLedger
+
+    ledger = OrchestrationLedger(db_path)
+    assert ledger.get("deleg_submit_failure")["state"] == "retained_diagnostic"
+    assert ledger.get("deleg_submit_failure_0")["state"] == "retained_diagnostic"
+    assert ledger.get("deleg_submit_failure_1")["state"] == "retained_diagnostic"
+    with sqlite3.connect(db_path) as con:
+        state, delivery, adjudication = con.execute(
+            """SELECT state, delivery_state, adjudication_state
+                 FROM async_delegations WHERE delegation_id='deleg_submit_failure'"""
+        ).fetchone()
+    assert (state, delivery, adjudication) == ("rejected", "delivered", "adjudicated")
+
+
+def test_batch_allocates_and_reaps_one_canonical_child_per_result(monkeypatch, tmp_path):
+    db_path = tmp_path / "state.db"
+    monkeypatch.setattr(ad, "_db_path", lambda: db_path)
+    record = {
+        "delegation_id": "deleg_batch",
+        "origin_session": "cli",
+        "session_key": "cli",
+        "origin_ui_session_id": "cli",
+        "parent_session_id": "parent",
+        "origin_session_id": "parent",
+        "status": "running",
+        "dispatched_at": time.time(),
+        "is_batch": True,
+        "goals": ["one", "two"],
+        "child_roles": ["orchestrator", "leaf"],
+    }
+    ad._persist_dispatch(record)
+    results = [
+        {
+            "status": "completed",
+            "summary": "one done",
+            "child_session_id": "child-1",
+            "allocation_id": "deleg_batch_0",
+        },
+        {
+            "status": "completed",
+            "summary": "two done",
+            "child_session_id": "child-2",
+            "allocation_id": "deleg_batch_1",
+        },
+    ]
+    ad._persist_completion(
+        {
+            **record,
+            "status": "completed",
+            "completed_at": time.time(),
+        },
+        {"status": "completed", "results": results, "summary": "batch done"},
+    )
+
+    from tools.orchestration_ledger import OrchestrationLedger
+
+    ledger = OrchestrationLedger(db_path)
+    group = ledger.get("deleg_batch")
+    children = ledger.descendants("deleg_batch")
+    assert group["state"] == "reaped"
+    assert [
+        (c["allocation_id"], c["owner_session_id"], c["role"], c["state"])
+        for c in children
+    ] == [
+        ("deleg_batch_0", "child-1", "orchestrator", "reaped"),
+        ("deleg_batch_1", "child-2", "leaf", "reaped"),
+    ]
+
+
+def test_synthetic_completion_adjudication_is_durable(monkeypatch, tmp_path):
+    db_path = tmp_path / "state.db"
+    monkeypatch.setattr(ad, "_db_path", lambda: db_path)
+    ad._persist_dispatch(
+        {
+            "delegation_id": "deleg_adjudicate",
+            "origin_session": "cli",
+            "origin_ui_session_id": "cli",
+            "parent_session_id": "parent",
+            "origin_session_id": "parent",
+            "status": "running",
+            "dispatched_at": time.time(),
+            "goal": "review",
+        }
+    )
+    ad._persist_completion(
+        {
+            "delegation_id": "deleg_adjudicate",
+            "status": "completed",
+            "completed_at": time.time(),
+        },
+        {"status": "completed", "summary": "done"},
+    )
+    assert ad.adjudicate_completion_message(
+        "[ASYNC DELEGATION COMPLETE — deleg_adjudicate]\nresult", success=True
+    )
+    durable = ad.get_durable_delegation("deleg_adjudicate")
+    assert durable is not None
+    assert durable["adjudication_state"] == "adjudicated"
+    assert durable["adjudicated_at"] is not None
+
+
+def test_duplicate_completion_is_idempotent_and_conflict_is_rejected(monkeypatch, tmp_path):
+    db_path = tmp_path / "state.db"
+    monkeypatch.setattr(ad, "_db_path", lambda: db_path)
+    record = {
+        "delegation_id": "deleg_duplicate",
+        "session_key": "parent",
+        "parent_session_id": "parent",
+        "status": "running",
+        "dispatched_at": time.time(),
+        "goal": "duplicate",
+    }
+    ad._persist_dispatch(record)
+    result = {"status": "completed", "summary": "first", "child_session_id": "child"}
+    event = {
+        **record,
+        "type": "async_delegation",
+        "status": "completed",
+        "completed_at": time.time(),
+        "allocation_id": "deleg_duplicate",
+    }
+    ad._persist_completion(dict(event), dict(result))
+    ad._persist_completion(dict(event), dict(result))
+
+    from tools.orchestration_ledger import OrchestrationLedger
+
+    ledger = OrchestrationLedger(db_path)
+    with sqlite3.connect(db_path) as con:
+        event_count = con.execute(
+            "SELECT count(*) FROM orchestration_events WHERE allocation_id='deleg_duplicate'"
+        ).fetchone()[0]
+    assert event_count == 3  # allocation + terminal receipt + reap receipt
+    assert ledger.get("deleg_duplicate")["state"] == "reaped"
+
+    with pytest.raises(RuntimeError, match="conflicting duplicate completion"):
+        ad._persist_completion(dict(event), {**result, "summary": "different"})
+    durable = ad.get_durable_delegation("deleg_duplicate")
+    assert durable is not None
+    assert durable["result"]["summary"] == "first"
+
+
+def test_restart_recovery_converges_terminal_transport_evidence(monkeypatch, tmp_path):
+    db_path = tmp_path / "state.db"
+    monkeypatch.setattr(ad, "_db_path", lambda: db_path)
+    record = {
+        "delegation_id": "deleg_crash_gap",
+        "session_key": "parent",
+        "parent_session_id": "parent",
+        "status": "running",
+        "dispatched_at": time.time(),
+        "goal": "recover",
+    }
+    ad._persist_dispatch(record)
+    result = {"status": "completed", "summary": "durable", "child_session_id": "child"}
+    event = {
+        **record,
+        "type": "async_delegation",
+        "status": "completed",
+        "completed_at": time.time(),
+        "allocation_id": "deleg_crash_gap",
+    }
+    with ad._transaction() as conn:
+        conn.execute(
+            """UPDATE async_delegations SET state='completed', event_json=?, result_json=?,
+                      completed_at=?, updated_at=? WHERE delegation_id=?""",
+            (json.dumps(event), json.dumps(result), time.time(), time.time(), "deleg_crash_gap"),
+        )
+
+    from tools.orchestration_ledger import OrchestrationLedger
+
+    assert OrchestrationLedger(db_path).get("deleg_crash_gap")["state"] == "running"
+    ad.recover_abandoned_delegations()
+    assert OrchestrationLedger(db_path).get("deleg_crash_gap")["state"] == "reaped"
+
+
+def test_failed_batch_child_is_retained_while_successful_sibling_reaps(monkeypatch, tmp_path):
+    db_path = tmp_path / "state.db"
+    monkeypatch.setattr(ad, "_db_path", lambda: db_path)
+    record = {
+        "delegation_id": "deleg_mixed_batch",
+        "session_key": "parent",
+        "parent_session_id": "parent",
+        "status": "running",
+        "dispatched_at": time.time(),
+        "is_batch": True,
+        "goals": ["ok", "fail"],
+    }
+    ad._persist_dispatch(record)
+    results = [
+        {"status": "completed", "summary": "ok", "child_session_id": "child-ok",
+         "allocation_id": "deleg_mixed_batch_0"},
+        {"status": "error", "error": "boom", "child_session_id": "child-fail",
+         "allocation_id": "deleg_mixed_batch_1"},
+    ]
+    ad._persist_completion(
+        {**record, "status": "completed", "completed_at": time.time()},
+        {"status": "completed", "summary": "mixed", "results": results},
+    )
+
+    from tools.orchestration_ledger import OrchestrationLedger
+
+    ledger = OrchestrationLedger(db_path)
+    assert ledger.get("deleg_mixed_batch_0")["state"] == "reaped"
+    failed = ledger.get("deleg_mixed_batch_1")
+    assert failed["state"] == "terminal_failure"
+    assert failed["resource_state"] == "retained"
+    assert ledger.get("deleg_mixed_batch")["state"] == "reaped"
+
+
+def test_durable_collector_sees_live_work_without_in_memory_record(monkeypatch, tmp_path):
+    db_path = tmp_path / "state.db"
+    monkeypatch.setattr(ad, "_db_path", lambda: db_path)
+    ad._reset_for_tests()
+    record = {
+        "delegation_id": "deleg_durable_collector",
+        "session_key": "parent",
+        "parent_session_id": "parent-session",
+        "status": "running",
+        "dispatched_at": time.time(),
+        "goal": "trusted collection",
+    }
+    ad._persist_dispatch(record)
+    assert ad.list_async_delegations() == []
+    assert ad.has_live_for_session(parent_session_id="parent-session") is True
+    event = {
+        **record,
+        "status": "completed",
+        "completed_at": time.time(),
+    }
+    result = {
+        "status": "completed",
+        "summary": "done",
+        "child_session_id": "child-session",
+    }
+    ad._persist_completion(event, result)
+    assert ad.has_live_for_session(parent_session_id="parent-session") is True
+    assert ad.mark_completion_adjudicated(
+        "deleg_durable_collector", success=True
+    ) is True
+    assert ad.has_live_for_session(parent_session_id="parent-session") is False
+    # A stale transport row cannot resurrect canonical work after adjudication.
+    with ad._transaction() as conn:
+        conn.execute(
+            "UPDATE async_delegations SET state='running' WHERE delegation_id=?",
+            ("deleg_durable_collector",),
+        )
+    assert ad.has_live_for_session(parent_session_id="parent-session") is False
+    from tools.orchestration_ledger import OrchestrationLedger
+
+    allocation = OrchestrationLedger(db_path).get("deleg_durable_collector")
+    assert allocation["launching_session_id"] == "parent-session"
+    assert allocation["owner_session_id"] == "child-session"
+    assert allocation["adjudication_state"] == "adjudicated"
 
 
 def test_rich_reinjection_block_is_self_contained():

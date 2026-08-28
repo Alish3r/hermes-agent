@@ -1488,7 +1488,10 @@ def _drain_oneshot_async_delegations(
     interruption, and provider/tool deadlines.  A shutdown signal still raises
     through this loop and reaches the normal cleanup path.
     """
-    from tools.async_delegation import has_live_for_session
+    from tools.async_delegation import (
+        adjudicate_completion_message,
+        has_live_for_session,
+    )
 
     session_id = str(
         getattr(getattr(cli, "agent", None), "session_id", None)
@@ -1530,7 +1533,15 @@ def _drain_oneshot_async_delegations(
                 break
             if not synthetic_message:
                 continue
-            run_turn(synthetic_message)
+            try:
+                run_turn(synthetic_message)
+            except Exception as exc:
+                adjudicate_completion_message(
+                    synthetic_message, success=False, error=str(exc)
+                )
+                raise
+            else:
+                adjudicate_completion_message(synthetic_message, success=True)
             processed += 1
             drained += 1
 
@@ -1552,7 +1563,15 @@ def _drain_oneshot_async_delegations(
                     break
                 if not synthetic_message:
                     continue
-                run_turn(synthetic_message)
+                try:
+                    run_turn(synthetic_message)
+                except Exception as exc:
+                    adjudicate_completion_message(
+                        synthetic_message, success=False, error=str(exc)
+                    )
+                    raise
+                else:
+                    adjudicate_completion_message(synthetic_message, success=True)
                 processed += 1
                 race_drained += 1
             live = _owned_live()
