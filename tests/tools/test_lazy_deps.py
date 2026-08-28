@@ -473,7 +473,9 @@ class TestInstallSpecs:
         monkeypatch.delenv("HERMES_DISABLE_LAZY_INSTALLS", raising=False)
         monkeypatch.delenv(ld._LAZY_TARGET_ENV, raising=False)
         monkeypatch.setattr(
-            "hermes_cli.config.load_config", lambda: {}, raising=False
+            "hermes_cli.config.load_config",
+            lambda: {"security": {"allow_lazy_installs": True}},
+            raising=False,
         )
         # Contract: install_specs never raises — even an unexpected installer
         # crash comes back as a failed result the caller can render.

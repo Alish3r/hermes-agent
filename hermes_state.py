@@ -7549,8 +7549,16 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         self, session_id: str, key: str, default: Any = None
     ) -> Any:
         """Read one key out of a session's model_config JSON (tolerant parse)."""
-        session = self.get_session(session_id) or {}
-        raw = session.get("model_config")
+        # Read only the required column. Besides avoiding a full session
+        # projection, this keeps epoch accounting independent from callers that
+        # wrap/guard get_session() for rotation checks.
+        with self._read_ctx() as conn:
+            row = conn.execute(
+                "SELECT model_config FROM sessions WHERE id = ?", (session_id,)
+            ).fetchone()
+        if row is None:
+            return default
+        raw = row["model_config"] if isinstance(row, sqlite3.Row) else row[0]
         config: Dict[str, Any] = {}
         if isinstance(raw, str) and raw.strip():
             try:

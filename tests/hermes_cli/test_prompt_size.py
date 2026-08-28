@@ -54,6 +54,42 @@ def test_runs_offline_without_credentials(isolated_home, monkeypatch):
     assert data["system_prompt"]["bytes"] > 0
 
 
+def test_inspection_agent_uses_configured_route_not_openrouter_placeholder(
+    isolated_home, monkeypatch
+):
+    import run_agent
+    from hermes_cli import config as config_mod
+    from hermes_cli import tools_config
+
+    captured = {}
+
+    def fake_agent(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(**kwargs)
+
+    monkeypatch.setattr(run_agent, "AIAgent", fake_agent)
+    monkeypatch.setattr(
+        config_mod,
+        "load_config",
+        lambda: {
+            "model": {
+                "default": "gpt-test",
+                "provider": "openai-codex",
+                "api_mode": "codex_responses",
+            }
+        },
+    )
+    monkeypatch.setattr(tools_config, "_get_platform_tools", lambda cfg, platform: [])
+
+    _build_inspection_agent("cli")
+
+    assert captured["provider"] == "openai-codex"
+    assert captured["requested_provider"] == "openai-codex"
+    assert captured["api_mode"] == "codex_responses"
+    assert captured["base_url"] == "https://inspect.invalid/openai-codex"
+    assert "openrouter.ai" not in captured["base_url"]
+
+
 
 
 

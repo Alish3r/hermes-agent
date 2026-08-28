@@ -524,7 +524,17 @@ class TestResolveVisionCustomProvider:
 
             from agent.auxiliary_client import resolve_vision_provider_client
 
-            provider, client, model = resolve_vision_provider_client()
+            # Bind the authoritative turn-local runtime. Legacy module mirrors
+            # are introspection-only and may retain another test file's
+            # compatibility snapshot in a direct all-in-one pytest process.
+            with aux.scoped_runtime_main({
+                "provider": "custom",
+                "model": "claude-opus-4-8",
+                "base_url": "https://my.endpoint.example/v1",
+                "api_key": aux._RUNTIME_MAIN_API_KEY,
+                "api_mode": "anthropic_messages",
+            }):
+                provider, client, model = resolve_vision_provider_client()
 
         assert provider == "custom"
         assert client is mock_client
@@ -560,7 +570,13 @@ class TestResolveVisionCustomProvider:
 
             from agent.auxiliary_client import resolve_vision_provider_client
 
-            provider, client, model = resolve_vision_provider_client()
+            with aux.scoped_runtime_main({
+                "provider": "custom:copilot-gateway",
+                "model": "claude-opus-4-8",
+                "base_url": "https://named.example/v1",
+                "api_key": aux._RUNTIME_MAIN_API_KEY,
+            }):
+                provider, client, model = resolve_vision_provider_client()
 
         assert provider == "custom:copilot-gateway"
         assert client is mock_client
@@ -595,7 +611,10 @@ class TestResolveVisionCustomProvider:
 
             from agent.auxiliary_client import resolve_vision_provider_client
 
-            provider, client, model = resolve_vision_provider_client()
+            # Model the non-gateway path without inheriting another test
+            # file's turn-local ContextVar in a direct broad run.
+            with aux.scoped_runtime_main(None):
+                provider, client, model = resolve_vision_provider_client()
 
         assert client is mock_client
         kwargs = mock_resolve.call_args.kwargs

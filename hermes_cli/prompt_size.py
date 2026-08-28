@@ -61,6 +61,13 @@ def _build_inspection_agent(platform: str) -> Any:
     cfg = load_config()
     model_cfg = cfg.get("model", {}) if isinstance(cfg.get("model"), dict) else {}
     model = model_cfg.get("default") or model_cfg.get("model") or ""
+    provider = str(model_cfg.get("provider") or cfg.get("provider") or "").strip()
+    api_mode = str(model_cfg.get("api_mode") or "").strip() or None
+    base_url = str(model_cfg.get("base_url") or "").strip()
+    if not base_url:
+        # Never substitute a real provider here: the diagnostic is offline and
+        # the URL exists only to satisfy direct AIAgent construction.
+        base_url = f"https://inspect.invalid/{provider or 'unconfigured'}"
 
     # Resolve platform-specific toolsets the same way the gateway does.
     enabled_toolsets = sorted(_get_platform_tools(cfg, platform))
@@ -71,8 +78,11 @@ def _build_inspection_agent(platform: str) -> Any:
 
     return AIAgent(
         model=model,
+        provider=provider or None,
+        requested_provider=provider or None,
+        api_mode=api_mode,
         api_key="inspect-only",
-        base_url="https://openrouter.ai/api/v1",
+        base_url=base_url,
         quiet_mode=True,
         save_trajectories=False,
         platform=platform,
@@ -287,6 +297,8 @@ def compute_prompt_breakdown(platform: str = "cli") -> Dict[str, Any]:
     return {
         "platform": platform,
         "model": getattr(agent, "model", "") or "",
+        "provider": getattr(agent, "provider", "") or "",
+        "api_mode": getattr(agent, "api_mode", "") or "",
         "system_prompt": {"chars": len(full), "bytes": _bytes(full)},
         "skills_index": {"chars": len(skills_index), "bytes": _bytes(skills_index)},
         "memory": {"chars": len(memory_block), "bytes": _bytes(memory_block)},
@@ -306,7 +318,13 @@ def render_breakdown(data: Dict[str, Any]) -> str:
     """Render the breakdown as plain text suitable for a terminal."""
     lines: List[str] = []
     sp = data["system_prompt"]
-    lines.append(f"Prompt-size breakdown (platform={data['platform']}, model={data['model'] or 'unset'})")
+    lines.append(
+        "Prompt-size breakdown "
+        f"(platform={data['platform']}, provider={data.get('provider') or 'unset'}, "
+        f"api_mode={data.get('api_mode') or 'estimated'}, "
+        f"model={data['model'] or 'unset'})"
+    )
+    lines.append("  Scope: offline fixed-payload estimate; no provider request was sent.")
     lines.append("")
     lines.append(f"  System prompt total : {sp['bytes']:>8,} B  ({_fmt_kb(sp['bytes'])}, {sp['chars']:,} chars)")
     lines.append("")

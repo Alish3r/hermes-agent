@@ -575,6 +575,94 @@ def test_concurrent_compression_does_not_fork_session(tmp_path: Path) -> None:
     )
 
 
+def test_epoch_final_slot_is_rechecked_after_compression_lease(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A delayed lease winner must not reuse a stale final epoch slot."""
+    import agent.conversation_compression as compression_module
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    session_id = "EPOCH_FINAL_SLOT_RACE"
+    db.create_session(
+        session_id,
+        source="test",
+        model_config={"_compression_epoch_count": 0},
+    )
+    messages = [{"role": "user", "content": f"m{i}"} for i in range(20)]
+    db.append_messages_batch(session_id, messages)
+
+    agent_a = _build_agent_with_db(db, session_id)
+    agent_b = _build_agent_with_db(db, session_id)
+    for agent in (agent_a, agent_b):
+        agent.compression_in_place = True
+        agent.max_compression_epochs = 1
+
+    first_reads = threading.Barrier(2)
+    real_epoch_state = compression_module.compression_epoch_state
+    calls_by_thread: dict[int, int] = {}
+
+    def synchronized_epoch_state(agent):
+        state = real_epoch_state(agent)
+        ident = threading.get_ident()
+        call_count = calls_by_thread.get(ident, 0)
+        calls_by_thread[ident] = call_count + 1
+        if call_count == 0:
+            first_reads.wait(timeout=5)
+        return state
+
+    monkeypatch.setattr(
+        compression_module, "compression_epoch_state", synchronized_epoch_state
+    )
+
+    first_finished = threading.Event()
+    acquire_holders: list[str] = []
+    delayed_agent_token = f"agent={id(agent_b):x}"
+    real_acquire = SessionDB.try_acquire_compression_lock
+
+    def delayed_acquire(self, sid, holder, ttl_seconds=300.0):
+        acquire_holders.append(holder)
+        if delayed_agent_token in holder:
+            assert first_finished.wait(timeout=5)
+        return real_acquire(self, sid, holder, ttl_seconds=ttl_seconds)
+
+    monkeypatch.setattr(SessionDB, "try_acquire_compression_lock", delayed_acquire)
+
+    errors: list[BaseException] = []
+
+    def run(agent):
+        try:
+            agent._compress_context(messages, "sys", approx_tokens=120_000)
+        except BaseException as exc:  # surface thread failures in the parent
+            errors.append(exc)
+        finally:
+            if threading.current_thread().name == "epoch-first":
+                first_finished.set()
+
+    first = threading.Thread(target=run, args=(agent_a,), name="epoch-first")
+    delayed = threading.Thread(target=run, args=(agent_b,), name="epoch-delayed")
+    first.start()
+    delayed.start()
+    first.join(timeout=10)
+    delayed.join(timeout=10)
+
+    assert not first.is_alive() and not delayed.is_alive()
+    assert errors == []
+    assert len(acquire_holders) == 2
+    assert {holder.split(":agent=")[1].split(":", 1)[0] for holder in acquire_holders} == {
+        f"{id(agent_a):x}",
+        f"{id(agent_b):x}",
+    }
+    assert db.get_session_model_config_value(
+        session_id, "_compression_epoch_count", 0
+    ) == 1
+    assert sum(agent.context_compressor.compress.call_count for agent in (agent_a, agent_b)) == 1
+    assert sum(
+        bool(getattr(agent, "_last_compression_epoch_cap_reached", False))
+        for agent in (agent_a, agent_b)
+    ) == 1
+    assert db.get_compression_lock_holder(session_id) is None
+
+
 def test_durable_message_committed_before_lease_is_adopted(
     tmp_path: Path,
 ) -> None:
@@ -913,7 +1001,10 @@ def test_full_in_place_compression_atomically_clears_durable_prune_runway(
     assert [message["content"] for message in db.get_messages_as_conversation(session_id)] == [
         message["content"] for message in compressed
     ]
-    assert json.loads(db.get_session(session_id)["model_config"]) == {"keep": "value"}
+    assert json.loads(db.get_session(session_id)["model_config"]) == {
+        "keep": "value",
+        "_compression_epoch_count": 1,
+    }
 
 
 def test_rotation_child_starts_without_durable_prune_runway(tmp_path: Path) -> None:

@@ -539,6 +539,30 @@ def build_turn_context(
     except Exception:
         logger.debug("between-turns MCP tool refresh skipped", exc_info=True)
 
+    # Typed async completions are machine evidence, not an ordinary actionable
+    # user turn. Preserve the str-compatible fenced rendering on the provider
+    # wire, and stamp durable presentation/trust metadata before persistence.
+    try:
+        from agent.completion_envelope import UntrustedCompletionEnvelope
+
+        if isinstance(user_message, UntrustedCompletionEnvelope):
+            persist_user_display_kind = (
+                persist_user_display_kind or "async_delegation_complete"
+            )
+            persist_user_display_metadata = dict(
+                persist_user_display_metadata or {}
+            )
+            persist_user_display_metadata.update(
+                {
+                    "delegation_id": user_message.delegation_id,
+                    "trust": "untrusted_worker_data",
+                    "authorizes_side_effects": False,
+                    "stale": user_message.stale,
+                }
+            )
+    except ImportError:  # pragma: no cover - packaged module is required
+        pass
+
     # Sanitize surrogate characters from user input.
     if isinstance(user_message, str):
         user_message = sanitize_surrogates(user_message)

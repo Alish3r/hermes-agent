@@ -371,7 +371,10 @@ build-backend = "setuptools.build_meta"
 
 [project.scripts]
 hermes = "hermes_cli.main:main"
-hermes-agent = "run_agent:main"
+# Public compatibility alias: it must traverse the same profile/config/provider/
+# session dispatcher as `hermes`.  The direct development runner remains
+# available explicitly as `python -m run_agent`, not as an installed command.
+hermes-agent = "hermes_cli.main:main"
 hermes-acp = "acp_adapter.entry:main"
 
 [tool.uv]

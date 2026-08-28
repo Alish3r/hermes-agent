@@ -36,10 +36,9 @@ def _set_approval(subsystem, enabled):
 # Config resolution
 # ---------------------------------------------------------------------------
 
-def test_default_gate_is_off(hermes_home):
+def test_memory_default_requires_approval_skills_remain_opt_in(hermes_home):
     from tools import write_approval as wa
-    # Default: gate off → writes flow freely.
-    assert wa.write_approval_enabled("memory") is False
+    assert wa.write_approval_enabled("memory") is True
     assert wa.write_approval_enabled("skills") is False
 
 
@@ -68,9 +67,10 @@ def test_normalize_enabled_coerces_values():
 # ---------------------------------------------------------------------------
 
 def test_memory_gate_off_allows_write(hermes_home):
-    # Default (gate off) → write straight through, no staging.
+    # An explicit opt-out preserves the legacy write-through behavior.
     from tools.memory_tool import memory_tool, MemoryStore
     from tools import write_approval as wa
+    _set_approval("memory", False)
     store = MemoryStore(); store.load_from_disk()
     r = json.loads(memory_tool("add", "user", "save me", store=store))
     assert r["success"] is True

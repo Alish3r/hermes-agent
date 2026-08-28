@@ -82,6 +82,12 @@ def test_skip_memory_memory_tool_handler_works_and_provider_skipped(
     # (agent/tool_executor.py wires store=agent._memory_store).
     from tools.memory_tool import memory_tool
 
+    # This regression covers store availability, not the independent durable
+    # write-approval policy. Explicitly opt out so the write can be observed.
+    monkeypatch.setattr(
+        "tools.write_approval.write_approval_enabled", lambda _subsystem: False
+    )
+
     raw = memory_tool(
         action="add",
         target="memory",

@@ -192,6 +192,21 @@ class OrchestrationLedger:
                         REFERENCES orchestration_allocations(allocation_id)
                 )"""
             )
+            conn.execute(
+                """CREATE TABLE IF NOT EXISTS orchestration_spawn_reservations (
+                    operation_id TEXT PRIMARY KEY,
+                    root_allocation_id TEXT NOT NULL,
+                    owner_session_id TEXT NOT NULL,
+                    allowed INTEGER NOT NULL CHECK (allowed IN (0, 1)),
+                    used_after INTEGER NOT NULL,
+                    configured_limit INTEGER NOT NULL,
+                    created_at REAL NOT NULL
+                )"""
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_orch_spawn_root "
+                "ON orchestration_spawn_reservations(root_allocation_id, allowed)"
+            )
             allocation_columns = {
                 row[1] for row in conn.execute("PRAGMA table_info(orchestration_allocations)")
             }
@@ -363,6 +378,92 @@ class OrchestrationLedger:
                     (allocation_id,),
                 ).fetchone()
             )
+
+    def reserve_spawn(
+        self,
+        *,
+        root_allocation_id: str,
+        owner_session_id: str,
+        operation_id: str,
+        limit: int,
+    ) -> dict[str, Any]:
+        """Permanently reserve one dispatch slot for a canonical root lineage."""
+        if not root_allocation_id or not owner_session_id or not operation_id:
+            raise ValueError(
+                "root_allocation_id, owner_session_id and operation_id are required"
+            )
+        normalized_limit = max(0, int(limit or 0))
+        with self._transaction() as conn:
+            # The decision is a read-modify-write invariant. A deferred SQLite
+            # transaction allows concurrent readers to observe the same count
+            # and oversubscribe before either inserts, so acquire the writer
+            # reservation before the replay/count checks.
+            conn.execute("BEGIN IMMEDIATE")
+            replay = conn.execute(
+                """SELECT allowed, used_after, configured_limit
+                     FROM orchestration_spawn_reservations WHERE operation_id=?""",
+                (operation_id,),
+            ).fetchone()
+            if replay is not None:
+                replay_limit = int(replay["configured_limit"])
+                used = int(replay["used_after"])
+                return {
+                    "allowed": bool(replay["allowed"]),
+                    "used": used,
+                    "remaining": max(0, replay_limit - used),
+                    "limit": replay_limit,
+                }
+            used = int(
+                conn.execute(
+                    """SELECT COUNT(*) FROM orchestration_spawn_reservations
+                         WHERE root_allocation_id=? AND allowed=1""",
+                    (root_allocation_id,),
+                ).fetchone()[0]
+            )
+            allowed = normalized_limit <= 0 or used < normalized_limit
+            used_after = used + (1 if allowed and normalized_limit > 0 else 0)
+            conn.execute(
+                """INSERT INTO orchestration_spawn_reservations
+                   (operation_id, root_allocation_id, owner_session_id, allowed,
+                    used_after, configured_limit, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    operation_id,
+                    root_allocation_id,
+                    owner_session_id,
+                    int(allowed),
+                    used_after,
+                    normalized_limit,
+                    self.clock(),
+                ),
+            )
+            return {
+                "allowed": allowed,
+                "used": used_after,
+                "remaining": max(0, normalized_limit - used_after),
+                "limit": normalized_limit,
+            }
+
+    def spawn_budget_status(
+        self, root_allocation_id: str, *, limit: int
+    ) -> dict[str, Any]:
+        """Return durable aggregate usage for one canonical root lineage."""
+        normalized_limit = max(0, int(limit or 0))
+        with self._transaction() as conn:
+            used = int(
+                conn.execute(
+                    """SELECT COUNT(*) FROM orchestration_spawn_reservations
+                         WHERE root_allocation_id=? AND allowed=1""",
+                    (root_allocation_id,),
+                ).fetchone()[0]
+            )
+        return {
+            "used": used,
+            "remaining": (
+                None if normalized_limit <= 0 else max(0, normalized_limit - used)
+            ),
+            "limit": normalized_limit,
+        }
 
     def get(self, allocation_id: str) -> dict[str, Any]:
         with self._transaction() as conn:

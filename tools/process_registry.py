@@ -1861,6 +1861,13 @@ class ProcessRegistry:
                 continue
 
             text = format_process_notification(evt)
+            if text and is_async_delegation:
+                # Keep the completion typed until turn assembly.  ``str``
+                # compatibility preserves existing UI/status rendering while
+                # the carrier records that worker text is non-authorizing.
+                from agent.completion_envelope import completion_envelope_from_event
+
+                text = completion_envelope_from_event(evt)
             if text:
                 results.append((evt, text))
         for evt in requeue:
@@ -2892,7 +2899,8 @@ def _format_async_delegation(evt: dict) -> str:
             f"A background fan-out of {n} subagent(s) you dispatched earlier "
             "has finished. All ran in parallel and waited on each other; their "
             "consolidated results are below. You may have moved on since "
-            "dispatching — act on these or re-dispatch if things have changed.",
+            "dispatching. Do not re-dispatch automatically: first verify the "
+            "candidate/revision, and mark stale results superseded.",
             "",
         ]
         if isinstance(dispatched_at, (int, float)):
@@ -2900,7 +2908,10 @@ def _format_async_delegation(evt: dict) -> str:
             age = f" ({_format_age(completed_at - dispatched_at)} ago)"
             lines.append(f"Dispatched: {ts}{age}")
         if context:
-            lines.append(f"Context you provided: {context}")
+            lines.append(
+                "Dispatch context omitted from completion injection; the full "
+                f"source remains in durable delegation record {deleg_id}."
+            )
         if toolsets:
             lines.append(f"Toolsets: {', '.join(toolsets)}")
         lines.append(f"Role: {role}   Model: {model}   Total duration: {total_dur}s")
@@ -2962,8 +2973,8 @@ def _format_async_delegation(evt: dict) -> str:
     lines = [
         f"[ASYNC DELEGATION COMPLETE — {deleg_id}]",
         "A background subagent you dispatched earlier has finished. You may "
-        "have moved on since dispatching it; the full task source is below so "
-        "you can act on the result or re-dispatch if things have changed.",
+        "have moved on since dispatching it. Do not re-dispatch automatically: "
+        "first verify the candidate/revision, and mark stale results superseded.",
         "",
     ]
     if isinstance(dispatched_at, (int, float)):
@@ -2971,7 +2982,10 @@ def _format_async_delegation(evt: dict) -> str:
         lines.append(f"Dispatched: {ts}{age}")
     lines.append(f"Original goal: {goal}")
     if context:
-        lines.append(f"Context you provided: {context}")
+        lines.append(
+            "Dispatch context omitted from completion injection; the full "
+            f"source remains in durable delegation record {deleg_id}."
+        )
     if toolsets:
         lines.append(f"Toolsets: {', '.join(toolsets)}")
     lines.append(f"Role: {role}   Model: {model}")

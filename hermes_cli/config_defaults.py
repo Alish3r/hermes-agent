@@ -867,7 +867,7 @@ DEFAULT_CONFIG = {
                                       # 0 for long-running rolling-compaction sessions
                                       # where you want nothing pinned except the
                                       # system prompt + rolling summary + recent tail.
-        "abort_on_summary_failure": False,  # When True, auto-compression that fails
+        "abort_on_summary_failure": True,  # Lossless default: auto-compression that fails
                                       # to generate a summary (aux LLM errored / returned
                                       # non-JSON / timed out) aborts entirely instead of
                                       # dropping the middle window with a static
@@ -875,9 +875,11 @@ DEFAULT_CONFIG = {
                                       # preserved unchanged and the session "freezes" at
                                       # its current size until the user runs /compress
                                       # (which bypasses the failure cooldown) or /new.
-                                      # Default False matches historical behavior; set to
-                                      # True if you'd rather pause than silently lose
-                                      # context turns when your aux model is flaky.
+                                      # Explicit legacy false remains honored.
+        "max_epochs": 4,             # committed compactions per durable lineage;
+                                      # aborted attempts do not count. At the cap,
+                                      # preserve messages and require a fresh-session
+                                      # handoff instead of recompressing forever.
         "codex_gpt55_autoraise": True,  # Historical key name kept for compatibility.
                                       # When True, gpt-5.4 / gpt-5.5 / gpt-5.6 on the
                                       # ChatGPT Codex OAuth route raise their compaction
@@ -1642,7 +1644,7 @@ DEFAULT_CONFIG = {
 
     # Privacy settings
     "privacy": {
-        "redact_pii": False,  # When True, hash user IDs and strip phone numbers from LLM context
+        "redact_pii": True,  # Hash compatible platform IDs and strip phone numbers from LLM context
     },
 
     # Text-to-speech configuration
@@ -1890,8 +1892,7 @@ DEFAULT_CONFIG = {
         # Approval gate for memory writes (add/replace/remove), applied to BOTH
         # foreground agent turns and the background self-improvement review fork
         # (the source of unprompted "wrong assumption" saves users reported).
-        #   false (default) — write freely; the gate is off (pre-gate behaviour)
-        #   true            — require approval: foreground writes prompt inline
+        #   true (default)  — require approval: foreground writes prompt inline
         #                     (entries are small enough to review in a chat
         #                     bubble); background-review writes are staged
         #                     instead of committed (a daemon thread cannot block
@@ -1899,7 +1900,7 @@ DEFAULT_CONFIG = {
         #                     /memory pending, /memory approve <id>,
         #                     /memory reject <id>.
         # To disable memory entirely, use memory_enabled: false instead.
-        "write_approval": False,
+        "write_approval": True,
         "memory_char_limit": 2200,   # ~800 tokens at 2.75 chars/token
         "user_char_limit": 1375,     # ~500 tokens at 2.75 chars/token
         # Periodic built-in memory review. External providers with automatic
@@ -1962,6 +1963,10 @@ DEFAULT_CONFIG = {
                                        # delegation units. New async dispatches beyond the cap
                                        # fall back to synchronous execution. Floor of 1, no ceiling.
                                        # (Replaces the deprecated max_async_children.)
+        "max_spawn_calls_per_session": 6,  # durable aggregate reservations per
+                                      # canonical root orchestration lineage;
+                                      # accepted reservations remain consumed if
+                                      # downstream child construction later fails.
         # Orchestrator role controls (see tools/delegate_tool.py:_get_max_spawn_depth
         # and _get_orchestrator_enabled).  Floored at 1, no upper ceiling —
         # raise deliberately, each level multiplies API cost.
@@ -2471,7 +2476,7 @@ DEFAULT_CONFIG = {
         "tirith_enabled": True,
         "tirith_path": "tirith",
         "tirith_timeout": 5,
-        "tirith_fail_open": True,
+        "tirith_fail_open": False,
         "website_blocklist": {
             "enabled": False,
             "domains": [],
@@ -2491,7 +2496,7 @@ DEFAULT_CONFIG = {
         # ``pip install`` for everything beyond the base set — appropriate
         # for restricted networks, audited environments, or air-gapped
         # systems where any runtime install is unacceptable.
-        "allow_lazy_installs": True,
+        "allow_lazy_installs": False,
     },
 
     "cron": {
@@ -3137,6 +3142,12 @@ DEFAULT_CONFIG = {
     # entry forever.  Without auto-pruning, a heavy user (gateway + cron)
     # reports 384MB+ databases with 68K+ messages, which slows down FTS5
     # inserts, /resume listing, and insights queries.
+    "session_reset": {
+        "mode": "idle",
+        "idle_minutes": 1440,
+        "notify": True,
+    },
+
     "sessions": {
         # When true, prune ended sessions inactive for retention_days once
         # per (roughly) min_interval_hours at CLI/gateway/cron startup.

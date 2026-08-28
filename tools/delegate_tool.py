@@ -3681,6 +3681,18 @@ def _validate_batch_tasks(task_list: List[Dict[str, Any]]) -> Optional[str]:
     return None
 
 
+def _resolve_spawn_budget_root_id(
+    *,
+    ledger: Any,
+    parent_allocation_id: str,
+    origin_session_id: str,
+) -> str:
+    """Resolve one stable budget key for a complete root lineage."""
+    if parent_allocation_id:
+        return str(ledger.get(parent_allocation_id)["root_allocation_id"])
+    return f"session:{origin_session_id}" if origin_session_id else ""
+
+
 def delegate_task(
     goal: Optional[str] = None,
     context: Optional[str] = None,
@@ -3905,6 +3917,58 @@ def delegate_task(
     _origin_owner_transport, _origin_owner_session_record = (
         _capture_gateway_steer_authority(_origin_ui_session_id)
     )
+
+    # Reserve aggregate capacity BEFORE constructing any child. The canonical
+    # SQLite ledger is the authority, so a fresh process, nested orchestrator,
+    # or replay cannot reset/double-charge the root lineage budget.
+    _spawn_limit = int(cfg.get("max_spawn_calls_per_session", 0) or 0)
+    if _spawn_limit > 0:
+        from agent.delegation_context import current_orchestration_allocation_id
+        from tools.async_delegation import _db_path
+        from tools.orchestration_ledger import OrchestrationLedger
+
+        _spawn_ledger = OrchestrationLedger(_db_path())
+        _parent_allocation_id = current_orchestration_allocation_id() or ""
+        _root_session_id = (
+            _origin_ui_session_id
+            or _origin_wake_sid
+            or str(getattr(parent_agent, "session_id", "") or "")
+        )
+        try:
+            _spawn_root_id = _resolve_spawn_budget_root_id(
+                ledger=_spawn_ledger,
+                parent_allocation_id=_parent_allocation_id,
+                origin_session_id=_root_session_id,
+            )
+        except Exception as exc:
+            return tool_error(
+                "Delegation spawn budget could not verify the canonical root "
+                f"lineage ({type(exc).__name__}: {exc}); refusing before child "
+                "construction."
+            )
+        if not _spawn_root_id:
+            return tool_error(
+                "Delegation spawn budget could not resolve a stable root session; "
+                "refusing before child construction."
+            )
+        _spawn_reservation = _spawn_ledger.reserve_spawn(
+            root_allocation_id=_spawn_root_id,
+            owner_session_id=(
+                _origin_ui_session_id
+                or _origin_wake_sid
+                or str(getattr(parent_agent, "session_id", "") or "unknown")
+            ),
+            operation_id=f"spawn:{live_deleg_id}",
+            limit=_spawn_limit,
+        )
+        if not _spawn_reservation["allowed"]:
+            return tool_error(
+                "Session delegation circuit breaker reached "
+                f"({_spawn_reservation['used']}/{_spawn_limit} spawn calls; "
+                "0 remaining). Do not retry or re-dispatch automatically. "
+                "Consolidate existing evidence or start a fresh explicitly "
+                "authorized root orchestration lineage."
+            )
 
     # Build all child agents on the main thread (thread-safe construction).
     # _build_child_preserving_parent_tools saves/restores the parent's

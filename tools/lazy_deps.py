@@ -524,7 +524,7 @@ def _allow_lazy_installs() -> bool:
         cfg = None
     if cfg is not None:
         sec = cfg.get("security") or {}
-        if not bool(sec.get("allow_lazy_installs", True)):
+        if not bool(sec.get("allow_lazy_installs", False)):
             return False
 
     # (2) Sealed-venv env var: blocks ONLY when there is no safe durable

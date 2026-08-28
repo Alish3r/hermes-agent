@@ -79,6 +79,96 @@ from agent.session_activity import ActivityProvenance, normalize_activity_proven
 
 logger = logging.getLogger(__name__)
 
+COMPRESSION_EPOCH_MODEL_CONFIG_KEY = "_compression_epoch_count"
+
+
+def compression_epoch_state(agent: Any) -> dict[str, Any]:
+    """Read the monotonic committed-compaction count from durable metadata."""
+    raw_limit = getattr(agent, "max_compression_epochs", None)
+    if raw_limit is None:
+        try:
+            from hermes_cli.config import load_config_readonly
+
+            config = load_config_readonly()
+            compression_config = (
+                config.get("compression", {}) if isinstance(config, dict) else {}
+            )
+            raw_limit = (
+                compression_config.get("max_epochs", 4)
+                if isinstance(compression_config, dict)
+                else 4
+            )
+        except Exception:
+            raw_limit = 4
+    try:
+        limit = int(raw_limit or 4)
+    except (TypeError, ValueError):
+        limit = 4
+    limit = max(1, limit)
+    value: Any = 0
+    read_failed = False
+    db = getattr(agent, "_session_db", None)
+    session_id = str(getattr(agent, "session_id", "") or "")
+    # Inspect the concrete type so dynamic test doubles cannot masquerade as
+    # a durable SessionDB accessor and accidentally consume unrelated reads.
+    reader = getattr(type(db), "get_session_model_config_value", None)
+    if session_id and callable(reader):
+        try:
+            value = reader(db, session_id, COMPRESSION_EPOCH_MODEL_CONFIG_KEY, 0)
+        except Exception:
+            logger.warning(
+                "Could not read durable compression epoch for session=%s; "
+                "failing closed at the configured epoch cap",
+                session_id,
+                exc_info=True,
+            )
+            read_failed = True
+    if read_failed:
+        return {
+            "count": limit,
+            "limit": limit,
+            "remaining": 0,
+            "blocked": True,
+            "read_error": True,
+        }
+    try:
+        count = max(0, int(value or 0))
+    except (TypeError, ValueError):
+        logger.warning(
+            "Malformed durable compression epoch for session=%s; "
+            "failing closed at the configured epoch cap",
+            session_id,
+        )
+        return {
+            "count": limit,
+            "limit": limit,
+            "remaining": 0,
+            "blocked": True,
+            "read_error": True,
+        }
+    return {
+        "count": count,
+        "limit": limit,
+        "remaining": max(0, limit - count),
+        "blocked": count >= limit,
+    }
+
+
+def _rotation_model_config_with_epoch(agent: Any, next_epoch: int) -> dict[str, Any]:
+    raw = getattr(agent, "_session_init_model_config", None)
+    if isinstance(raw, dict):
+        config = dict(raw)
+    elif isinstance(raw, str):
+        try:
+            parsed = json.loads(raw)
+            config = dict(parsed) if isinstance(parsed, dict) else {}
+        except (TypeError, json.JSONDecodeError):
+            config = {}
+    else:
+        config = {}
+    config[COMPRESSION_EPOCH_MODEL_CONFIG_KEY] = next_epoch
+    return config
+
 # Terminal compression outcomes published by host/hygiene timeout or cooldown
 # writers. Detached heartbeat workers must not clobber these back to
 # agent.compression after cancel (otherwise timeout is unobservable). Observing
@@ -2355,6 +2445,33 @@ def compress_context(
         prompt — the session is NOT rotated.  Callers should detect the
         no-op via ``len(returned) == len(input)`` and stop the retry loop.
     """
+    def _epoch_cap_response(epoch_state: dict[str, Any]):
+        if not epoch_state["blocked"]:
+            return None
+        agent._last_compression_epoch_cap_reached = True
+        guidance = (
+            "Compression epoch cap reached "
+            f"({epoch_state['count']}/{epoch_state['limit']}). Messages were preserved and "
+            "no summary was attempted. Start a new session with an explicit "
+            "handoff (or raise compression.max_epochs deliberately)."
+        )
+        emitter = getattr(agent, "_emit_warning", None)
+        if callable(emitter):
+            emitter(guidance)
+        else:
+            logger.warning(guidance)
+        existing_prompt = getattr(agent, "_cached_system_prompt", None)
+        if not existing_prompt:
+            existing_prompt = agent._build_system_prompt(system_message)
+        return messages, existing_prompt
+
+    _epoch = compression_epoch_state(agent)
+    _epoch_response = _epoch_cap_response(_epoch)
+    if _epoch_response is not None:
+        return _epoch_response
+    agent._last_compression_epoch_cap_reached = False
+    _next_compression_epoch = int(_epoch["count"]) + 1
+
     _compressor_attempt_snapshot = _snapshot_compressor_attempt_state(
         agent.context_compressor
     )
@@ -2850,6 +2967,27 @@ def compress_context(
                 _lock_sid,
             )
             return messages, _existing_sp
+
+    # The preflight epoch read happens before the durable compression lease and
+    # is therefore only an early refusal optimization. A delayed contender can
+    # acquire the lease after another in-place compaction commits its final
+    # epoch slot. Re-read under the lease so admission and publication are
+    # serialized by the same durable lock; only successful commits consume a
+    # slot, and no contender can reuse a stale count.
+    _epoch = compression_epoch_state(agent)
+    _epoch_response = _epoch_cap_response(_epoch)
+    if _epoch_response is not None:
+        _emit_compression_attempt_telemetry(
+            agent,
+            started_at=_attempt_started_at,
+            commit_status="aborted",
+            split_status="aborted",
+            failure_class="epoch_cap_reached",
+        )
+        _release_lock()
+        return _epoch_response
+    agent._last_compression_epoch_cap_reached = False
+    _next_compression_epoch = int(_epoch["count"]) + 1
 
     # Snapshot the authoritative durable cooldown only after this attempt owns
     # the session lease. This runs for force=True too, but does not apply the
@@ -3621,6 +3759,7 @@ def compress_context(
                         compressed,
                         model_config_patch={
                             PROACTIVE_PRUNE_REARM_MODEL_CONFIG_KEY: None,
+                            COMPRESSION_EPOCH_MODEL_CONFIG_KEY: _next_compression_epoch,
                         },
                         watermark=_commit_watermark,
                         lock_holder=_lock_holder,
@@ -3754,7 +3893,9 @@ def compress_context(
                         source=agent.platform
                         or os.environ.get("HERMES_SESSION_SOURCE", "cli"),
                         model=agent.model,
-                        model_config=agent._session_init_model_config,
+                        model_config=_rotation_model_config_with_epoch(
+                            agent, _next_compression_epoch
+                        ),
                         system_prompt=new_system_prompt,
                         messages=compressed,
                         cwd=getattr(agent, "working_directory", None),

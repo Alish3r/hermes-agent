@@ -18,7 +18,7 @@ Both stores are written from two origins:
 This module lets the user gate those writes per-subsystem with a boolean
 ``write_approval``:
 
-  * ``false`` (default) — write freely (the pre-gate behaviour)
+  * ``false`` — write freely (the historical behaviour)
   * ``true``            — require approval: do not commit the write; either
     prompt inline (memory, interactive CLI only) or **stage** it to a pending
     store and surface it for the user to approve or reject out-of-band
@@ -60,7 +60,7 @@ SKILLS = "skills"
 _SUBSYSTEMS = (MEMORY, SKILLS)
 
 # Config key (per subsystem). A single boolean: the approval gate is OFF by
-# default (writes flow freely, the pre-gate behaviour), and ON means stage /
+# default is resolved from the central config schema, and ON means stage /
 # prompt every write for the user's approval. There is intentionally no third
 # "block all writes" state — to disable a subsystem entirely use its own
 # enable flag (e.g. ``memory.memory_enabled: false``).
@@ -74,9 +74,9 @@ CONFIG_KEY = "write_approval"
 def write_approval_enabled(subsystem: str) -> bool:
     """Return whether the approval gate is enabled for ``subsystem``.
 
-    Reads ``<subsystem>.write_approval`` from config.yaml. Defaults to
-    ``False`` (gate off — writes flow freely) for any unset / invalid value so
-    existing installs keep their current behaviour until the user opts in.
+    Reads ``<subsystem>.write_approval`` from config.yaml. The central defaults
+    require approval for memory writes; malformed explicit values remain false
+    here for backward compatibility with hand-edited configurations.
     """
     if subsystem not in _SUBSYSTEMS:
         return False

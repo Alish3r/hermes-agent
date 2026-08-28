@@ -642,6 +642,14 @@ def recover_abandoned_delegations() -> int:
                     error=str(adjudication_error or ""),
                 )
         except Exception as exc:
+            # Legacy transport rows predate the canonical allocation ledger.
+            # Their absence is explicitly tolerated above and must not emit one
+            # warning per historical row on every startup. Preserve warnings
+            # for every other convergence failure.
+            from tools.orchestration_ledger import AllocationNotFound
+
+            if isinstance(exc, AllocationNotFound):
+                continue
             logger.warning("Lifecycle convergence deferred: %s", exc)
     try:
         from tools.orchestration_ledger import OrchestrationLedger
@@ -878,6 +886,9 @@ def adjudicate_completion_message(
     error: str = "",
 ) -> bool:
     """Adjudicate a synthetic completion turn by its immutable header id."""
+    typed_id = str(getattr(message, "delegation_id", "") or "")
+    if typed_id:
+        return mark_completion_adjudicated(typed_id, success=success, error=error)
     match = re.search(
         r"\[ASYNC DELEGATION(?: BATCH)? COMPLETE — (deleg_[A-Za-z0-9]+)\]",
         message or "",
