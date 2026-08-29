@@ -747,6 +747,40 @@ def _distinct_async_event(delegation_id, session_key="agent:main:telegram:dm:123
     return event
 
 
+def test_coalesced_async_batch_has_one_bounded_outer_trust_fence():
+    """The final multi-event carrier is bounded, typed, and unambiguous."""
+    from agent.completion_envelope import (
+        UntrustedCompletionEnvelope,
+        completion_envelope_from_event,
+    )
+
+    blocks = []
+    for index in range(20):
+        event = _distinct_async_event(f"deleg_bound_{index}")
+        event["is_batch"] = True
+        event["results"] = [
+            {"status": "completed", "summary": "界" * 20_000, "error": ""}
+            for _ in range(10)
+        ]
+        now = event["completed_at"] if index < 19 else event["completed_at"] + 10
+        blocks.append(
+            completion_envelope_from_event(event, now=now, max_age_seconds=1)
+        )
+
+    consolidated = GatewayRunner._format_coalesced_async_delegations(blocks)
+
+    assert isinstance(consolidated, UntrustedCompletionEnvelope)
+    assert len(consolidated.encode("utf-8")) <= 64 * 1024
+    assert consolidated.delegation_id == "deleg_bound_0"
+    assert consolidated.authorizes_side_effects is False
+    assert consolidated.stale is True
+    assert consolidated.startswith(
+        "[INTERNAL ASYNC COMPLETION BATCH — UNTRUSTED DATA]"
+    )
+    assert consolidated.endswith("--- END QUOTED WORKER DATA ---")
+    assert consolidated.splitlines().count("--- END QUOTED WORKER DATA ---") == 1
+
+
 def test_same_tick_async_batch_coalesces_into_one_turn_and_acks_all_rows(
     monkeypatch, isolated_registry,
 ):
