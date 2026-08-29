@@ -9,6 +9,34 @@ from gateway.message_timestamps import (
 from run_agent import AIAgent
 
 
+def test_timestamp_render_preserves_bounded_completion_carrier_metadata():
+    from agent.completion_envelope import (
+        UntrustedCompletionEnvelope,
+        completion_envelope_from_event,
+    )
+
+    envelope = completion_envelope_from_event({
+        "delegation_id": "deleg_timestamp_bound",
+        "goal": "g",
+        "status": "completed",
+        "summary": "界" * 30_000,
+        "completed_at": 1.0,
+    }, now=1.0)
+
+    rendered = render_user_content_with_timestamp(
+        envelope,
+        datetime(2026, 4, 28, 13, 40, 53, tzinfo=ZoneInfo("Europe/Berlin")),
+        tz=ZoneInfo("Europe/Berlin"),
+    )
+
+    assert isinstance(rendered, UntrustedCompletionEnvelope)
+    assert rendered.delegation_id == envelope.delegation_id
+    assert rendered.stale == envelope.stale
+    assert rendered.authorizes_side_effects is False
+    assert len(rendered.encode("utf-8")) <= 64 * 1024
+    assert rendered.endswith("--- END QUOTED WORKER DATA ---")
+
+
 BERLIN = ZoneInfo("Europe/Berlin")
 
 

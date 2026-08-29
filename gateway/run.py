@@ -26091,6 +26091,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     groups[key].append(evt)
                 for key in group_order:
                     group = groups[key]
+                    from agent.completion_envelope import MAX_COALESCED_COMPLETIONS
+
+                    # One bounded carrier can faithfully represent at most this
+                    # many siblings.  Leave overflow pending for a later tick
+                    # rather than acknowledging rows omitted by aggregate
+                    # truncation or flooding the session with multiple turns.
+                    overflow = group[MAX_COALESCED_COMPLETIONS:]
+                    group = group[:MAX_COALESCED_COMPLETIONS]
+                    for evt in overflow:
+                        _pr.completion_queue.put(evt)
                     try:
                         delivered = await self._deliver_async_delegation_group(group)
                         if delivered is False:

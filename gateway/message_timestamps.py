@@ -123,10 +123,24 @@ def render_user_content_with_timestamp(content: str, ts_value: Any = None, tz=No
     effective_ts = embedded_epoch if embedded_epoch is not None else ts_value
     prefix = format_message_timestamp(effective_ts, tz=tz)
     if not prefix:
-        return clean_content
-    if clean_content:
-        return f"{prefix} {clean_content}"
-    return prefix
+        rendered = clean_content
+    elif clean_content:
+        rendered = f"{prefix} {clean_content}"
+    else:
+        rendered = prefix
+
+    # Async completion carriers are str-compatible for provider role
+    # alternation, but their type and metadata are part of the trust contract.
+    # Timestamp rendering must not erase that contract or push a 64 KiB carrier
+    # over its aggregate wire ceiling.
+    from agent.completion_envelope import (
+        UntrustedCompletionEnvelope,
+        rerender_completion_envelope,
+    )
+
+    if isinstance(content, UntrustedCompletionEnvelope):
+        return rerender_completion_envelope(content, rendered)
+    return rendered
 
 
 def _parse_timestamp_prefix(text: str, tz=None) -> Optional[float]:

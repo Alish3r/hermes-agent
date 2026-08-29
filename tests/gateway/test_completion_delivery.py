@@ -779,6 +779,42 @@ def test_coalesced_async_batch_has_one_bounded_outer_trust_fence():
     )
     assert consolidated.endswith("--- END QUOTED WORKER DATA ---")
     assert consolidated.splitlines().count("--- END QUOTED WORKER DATA ---") == 1
+    for index in range(20):
+        assert f"delegation_{index + 1}:" in consolidated
+        assert f"deleg_bound_{index}" in consolidated
+
+
+def test_coalesced_async_batch_defers_overflow_without_acknowledging_it(
+    monkeypatch, isolated_registry,
+):
+    """A bounded turn delivers 20 siblings and leaves the 21st pending."""
+    from tools import async_delegation
+
+    isolated = queue.Queue()
+    monkeypatch.setattr(isolated_registry, "completion_queue", isolated)
+    events = [_distinct_async_event(f"deleg_overflow_{i}") for i in range(21)]
+    for event in events:
+        _persist_pending_completion(event)
+        isolated.put(dict(event))
+
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner = _runner(adapter)
+    _stop_after_sleeps(monkeypatch, runner, count=2)
+
+    asyncio.run(runner._async_delegation_watcher(interval=0))
+
+    adapter.handle_message.assert_awaited_once()
+    delivered = adapter.handle_message.await_args.args[0].text
+    for index in range(20):
+        assert f"deleg_overflow_{index}" in delivered
+        row = async_delegation.get_durable_delegation(f"deleg_overflow_{index}")
+        assert row is not None
+        assert row["delivery_state"] == "delivered"
+    assert "deleg_overflow_20" not in delivered
+    overflow_row = async_delegation.get_durable_delegation("deleg_overflow_20")
+    assert overflow_row is not None
+    assert overflow_row["delivery_state"] == "pending"
+    assert isolated.qsize() == 1
 
 
 def test_same_tick_async_batch_coalesces_into_one_turn_and_acks_all_rows(
