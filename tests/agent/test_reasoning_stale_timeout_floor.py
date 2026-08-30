@@ -56,6 +56,17 @@ import pytest
     ("deepseek/deepseek-v4-flash", 600.0),
     ("deepseek/deepseek-v4-pro", 600.0),
     ("deepseek-v4-flash-free", 600.0),   # catalog -free variant inherits via separator anchor
+    # Moonshot Kimi — K2/K3 are always-on reasoning models that emit
+    # reasoning_content in a separate delta before any content token, the
+    # same shape as the DeepSeek V4 series directly above.
+    ("moonshotai/kimi-k3", 600.0),
+    ("kimi-k3", 600.0),
+    ("moonshotai/Kimi-K2-Thinking", 600.0),
+    ("kimi-k2-thinking", 600.0),
+    ("kimi-k2.5", 600.0),
+    ("kimi-k2.7-code", 600.0),
+    ("accounts/fireworks/models/kimi-k2p6", 600.0),
+    ("kimi", 600.0),
     # Qwen QwQ + Qwen3 thinking variants (qwen3 family entry matches all).
     ("qwen/qwq-32b-preview", 300.0),
     ("qwen/qwen3-235b-a22b-thinking", 180.0),
@@ -98,6 +109,20 @@ def test_reasoning_stale_timeout_floor_positive_cases(model, expected):
 
 
 
+
+
+@pytest.mark.parametrize("model", [
+    "gpt-4o",
+    "olmo-1",
+    "nokimi-7b",        # `kimi` is not at start-of-slug
+    "llama-3-kimi-ft",  # community fine-tune, not a Moonshot endpoint
+])
+def test_reasoning_stale_timeout_floor_negative_cases(model):
+    from agent.reasoning_timeouts import get_reasoning_stale_timeout_floor
+    assert get_reasoning_stale_timeout_floor(model) is None, (
+        f"get_reasoning_stale_timeout_floor({model!r}) must not match: a bare "
+        f"substring in the middle of a slug is not a reasoning model."
+    )
 
 
 # ── integration: _resolved_api_call_stale_timeout_base ─────────────────────
