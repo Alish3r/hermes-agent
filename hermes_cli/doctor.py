@@ -811,6 +811,56 @@ def _check_gateway_service_linger(issues: list[str]) -> None:
 _APIKEY_PROVIDERS_CACHE: list | None = None
 
 
+# --- .env creation -------------------------------------------------------
+# Small seams (monkeypatchable in tests, and single points of control).
+
+def _chmod_owner_only(path) -> None:
+    """Seam: restrict a file to owner read/write."""
+    os.chmod(str(path), 0o600)
+
+
+def _env_file_mode(path):
+    """Seam: the POSIX mode bits actually on disk, or None if unreadable."""
+    import stat as _stat
+
+    try:
+        return _stat.S_IMODE(os.stat(str(path)).st_mode)
+    except OSError:
+        return None
+
+
+def _posix_modes_enforced() -> bool:
+    """Seam: do POSIX mode bits describe file access on this platform?"""
+    return os.name != "nt"
+
+
+def _create_protected_env_file(env_path) -> str:
+    """Create ``.env`` owner-only and report the protection that ACTUALLY applied.
+
+    Returns ``'secured'``, ``'unprotected'`` or ``'unsupported'``.
+
+    ``.env`` holds API keys. ``touch()`` obeys the umask (commonly 0o022),
+    which leaves the file group/world-readable, so it is tightened explicitly
+    — and then verified. A chmod that raises, or that silently does not take,
+    previously still printed a green "Created empty .env": the user was told
+    their key file was in place while it was world-readable. Verify, then
+    claim.
+
+    On Windows POSIX mode bits do not describe access (ACLs do), so the honest
+    answer there is ``'unsupported'`` rather than a pass we cannot justify or
+    a warning that would fire on every run.
+    """
+    env_path.parent.mkdir(parents=True, exist_ok=True)
+    env_path.touch()
+    try:
+        _chmod_owner_only(env_path)
+    except (OSError, NotImplementedError):
+        pass
+    if not _posix_modes_enforced():
+        return "unsupported"
+    return "secured" if _env_file_mode(env_path) == 0o600 else "unprotected"
+
+
 def _build_apikey_providers_list() -> list:
     """Build the API-key provider health-check list once and cache it.
 
@@ -1163,16 +1213,22 @@ def run_doctor(args):
         else:
             check_fail(f"{_DHH}/.env file missing")
             if should_fix:
-                env_path.parent.mkdir(parents=True, exist_ok=True)
-                env_path.touch()
-                # .env holds API keys — restrict to owner-only access from
-                # creation. touch() obeys umask which is commonly 0o022,
-                # leaving the file world-readable; tighten explicitly.
-                try:
-                    os.chmod(str(env_path), 0o600)
-                except OSError:
-                    pass
-                check_ok(f"Created empty {_DHH}/.env")
+                protection = _create_protected_env_file(env_path)
+                if protection == "secured":
+                    check_ok(f"Created empty {_DHH}/.env", "(mode 0600)")
+                elif protection == "unsupported":
+                    check_ok(f"Created empty {_DHH}/.env")
+                    check_info(
+                        "POSIX permissions are not enforced here — verify the "
+                        "file's ACL restricts it to your account before adding keys")
+                else:
+                    check_warn(
+                        f"Created empty {_DHH}/.env",
+                        "(could NOT restrict to 0600 — it may be readable by "
+                        "other users on this machine)")
+                    issues.append(
+                        f"Restrict {_DHH}/.env to owner-only before storing API "
+                        f"keys (chmod 600)")
                 check_info("Run 'hermes setup' to configure API keys")
                 fixed_count += 1
             else:

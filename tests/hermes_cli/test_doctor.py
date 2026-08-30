@@ -1471,3 +1471,58 @@ class TestDoctorDeprecatedConfigAndEnv:
         assert "Deprecated: delegation.max_async_children" in out
         assert "Deprecated: HERMES_TOOL_PROGRESS_MODE" in out
         assert "⚠" in out or "Deprecated" in out
+
+
+class TestEnvFileProtection:
+    """``doctor --fix`` creates ``.env``, which holds API keys.
+
+    ``Path.touch()`` obeys the umask (commonly 0o022), leaving the file
+    group/world-readable. The chmod that tightens it used to be wrapped in a
+    bare ``except OSError: pass`` followed unconditionally by a green check —
+    so on any filesystem where chmod fails or silently no-ops (NFS, some
+    mounts, a restrictive container) the doctor reported the key file as
+    created while it was in fact world-readable. A check must report the
+    protection that actually applied, not the one it attempted.
+    """
+
+    def test_reports_secured_when_chmod_applies(self, tmp_path):
+        env_path = tmp_path / ".env"
+        assert doctor._create_protected_env_file(env_path) == "secured"
+        assert env_path.exists()
+        assert (env_path.stat().st_mode & 0o777) == 0o600
+
+    def test_reports_unprotected_when_mode_did_not_take(
+            self, tmp_path, monkeypatch):
+        """The dangerous case: chmod appears to succeed but the bits are wrong."""
+        env_path = tmp_path / ".env"
+        monkeypatch.setattr(doctor, "_env_file_mode", lambda p: 0o644)
+        assert doctor._create_protected_env_file(env_path) == "unprotected"
+        assert env_path.exists(), "the file is still created; only the claim changes"
+
+    def test_reports_unprotected_when_mode_unreadable(
+            self, tmp_path, monkeypatch):
+        env_path = tmp_path / ".env"
+        monkeypatch.setattr(doctor, "_env_file_mode", lambda p: None)
+        assert doctor._create_protected_env_file(env_path) == "unprotected"
+
+    def test_windows_reports_unsupported_not_a_false_alarm(
+            self, tmp_path, monkeypatch):
+        """POSIX mode bits do not describe access on Windows.
+
+        Reporting 'unprotected' there would be its own false negative — the
+        opposite failure, and just as untrustworthy."""
+        env_path = tmp_path / ".env"
+        monkeypatch.setattr(doctor, "_posix_modes_enforced", lambda: False)
+        assert doctor._create_protected_env_file(env_path) == "unsupported"
+
+    def test_chmod_oserror_does_not_propagate(self, tmp_path, monkeypatch):
+        """A filesystem that refuses chmod must downgrade the claim, not crash."""
+        env_path = tmp_path / ".env"
+        monkeypatch.setattr(doctor, "_chmod_owner_only",
+                            lambda p: (_ for _ in ()).throw(OSError("nope")))
+        assert doctor._create_protected_env_file(env_path) == "unprotected"
+
+    def test_creates_parent_directory(self, tmp_path):
+        env_path = tmp_path / "nested" / "dir" / ".env"
+        doctor._create_protected_env_file(env_path)
+        assert env_path.exists()
