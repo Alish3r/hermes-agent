@@ -314,3 +314,55 @@ class TestReadOnly:
         issues: list[str] = []
         run_live_checks(issues)
         assert issues == []
+
+
+class TestProbeEndpointsAuthenticate:
+    """A live probe must fail on a bad credential, or it is not a probe.
+
+    ``fal.ai/api/models`` is the public website's model catalog: it answers
+    200 to an unauthenticated request and ignores the ``Authorization`` header
+    entirely, so the FAL probe reported ``pass`` for *any* non-empty
+    ``FAL_KEY`` — an expired or typo'd key included. The credential was never
+    checked. Mocked tests cannot catch that (they stub ``_http_get``), so this
+    pins the one property that is checkable offline: every probe URL must be
+    an authenticated API host rather than a public marketing domain.
+
+    To re-verify against the real services (no quota spent, metadata GET only)::
+
+        curl -s -o /dev/null -w '%{http_code}' \\
+             -H 'Authorization: Bearer bogus-key' <url>
+
+    A correct probe endpoint answers 401/403 there. 200 means it authenticates
+    nothing and the probe is decorative.
+    """
+
+    PROBE_URLS = (
+        doctor_live.FIRECRAWL_HEALTH_URL,
+        doctor_live.FAL_MODELS_URL,
+        doctor_live.OPENAI_MODELS_URL,
+        doctor_live.GROQ_MODELS_URL,
+        doctor_live.ELEVENLABS_VOICES_URL,
+    )
+
+    @pytest.mark.parametrize("url", PROBE_URLS)
+    def test_probe_url_is_an_api_host(self, url):
+        from urllib.parse import urlparse
+
+        host = urlparse(url).hostname or ""
+        assert host.split(".")[0] in {"api", "rest"}, (
+            f"{host} is not an API host — a public site can answer 200 to any "
+            f"credential, which makes the probe a false green")
+
+    def test_fal_probe_targets_authenticated_api(self):
+        assert doctor_live.FAL_MODELS_URL.startswith("https://api.fal.ai/")
+
+    def test_fal_invalid_key_fails_and_appends_issue(self, monkeypatch):
+        """Mirror of the Firecrawl case: a rejected key must surface as fail."""
+        monkeypatch.setenv("FAL_KEY", "bad-key")
+        monkeypatch.setattr(
+            doctor_live, "_http_get",
+            lambda *a, **k: SimpleNamespace(status_code=401))
+        issues: list = []
+        results = {r.name: r for r in run_live_checks(issues)}
+        assert results["FAL"].status == "fail"
+        assert any("FAL" in i for i in issues)

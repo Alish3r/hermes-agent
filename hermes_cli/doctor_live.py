@@ -34,7 +34,11 @@ DEFAULT_PROBE_TIMEOUT = 10.0
 
 # Metadata-only endpoints. None of these spend generation credits.
 FIRECRAWL_HEALTH_URL = "https://api.firecrawl.dev/v2/team/credit-usage"
-FAL_MODELS_URL = "https://fal.ai/api/models?page=1"
+# api.fal.ai validates the credential; fal.ai/api/models is the public
+# website catalog, which answers 200 to any key (or none) and made this
+# probe pass for an expired or typo'd FAL_KEY. A probe endpoint must
+# reject a bad credential or it is checking nothing.
+FAL_MODELS_URL = "https://api.fal.ai/v1/models"
 OPENAI_MODELS_URL = "https://api.openai.com/v1/models"
 GROQ_MODELS_URL = "https://api.groq.com/openai/v1/models"
 ELEVENLABS_VOICES_URL = "https://api.elevenlabs.io/v1/voices"
