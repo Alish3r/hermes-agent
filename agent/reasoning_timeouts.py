@@ -13,10 +13,10 @@ For NVIDIA Nemotron 3 Ultra on the hosted NIM gateway the empirical
 upstream idle kill is ~120s (first-party reproduction at
 NVIDIA/NemoClaw#4846 — TTFB ~31s, stream dies at 120s). The same
 failure mode exists on OpenAI o1/o3, Anthropic Opus 4.x thinking,
-DeepSeek R1, Qwen QwQ, xAI Grok reasoning — every cloud reasoning
-model hits upstream-proxies / load-balancers with idle timeouts
-shorter than the model's thinking phase. Result: the stale detector
-kills the connection mid-think, surfacing as
+DeepSeek R1, Moonshot Kimi K2/K3, Qwen QwQ, xAI Grok reasoning —
+every cloud reasoning model hits upstream-proxies / load-balancers
+with idle timeouts shorter than the model's thinking phase. Result:
+the stale detector kills the connection mid-think, surfacing as
 ``BrokenPipeError``/``RemoteProtocolError`` on the next read.
 
 This module provides a floor that the existing stale-detector scaling
@@ -74,6 +74,23 @@ _REASONING_STALE_TIMEOUT_FLOORS: tuple[tuple[str, int], ...] = (
     ("deepseek-reasoner", 600),
     ("deepseek-v4-flash", 600),
     ("deepseek-v4-pro", 600),
+    # Moonshot Kimi — K2/K3 are always-on-reasoning MoE models that emit
+    # ``reasoning_content`` in a separate delta field before any content
+    # token, structurally identical to the DeepSeek V4 series above.
+    # Measured directly against ``kimi-k3`` (2026-08-30): an 11 046-char
+    # document plus an analytical question spent 228s and 333s on two runs
+    # entirely inside the thinking phase, returning 8 765 chars of
+    # reasoning_content against 524 chars of answer — with no content delta
+    # until the very end. The same document with a trivial question ("reply
+    # ACK") finished in 38s, so it is reasoning depth, not context size, that
+    # blows the budget. Both defaults (180s stream / 90s non-stream) fire
+    # mid-think and kill a perfectly healthy call, so Kimi belongs in the
+    # deep-reasoning tier alongside deepseek-r1 / o1 / nemotron-3-ultra.
+    # One entry covers the family: the start-of-slug anchor matches
+    # ``kimi-k3``, ``kimi-k2-thinking``, ``kimi-k2.5``, ``kimi-k2p6`` and
+    # ``moonshotai/kimi-k3`` (aggregator prefix is stripped first), while
+    # ``nokimi-7b`` and ``llama-3-kimi-ft`` correctly do NOT match.
+    ("kimi", 600),
     # Qwen — QwQ reasoning + Qwen3 thinking variants.  QwQ-32B
     # preview is the stable slug; ``qwen3`` covers the family of
     # thinking-mode Qwen3 models (qwen3-235b-a22b, qwen3-32b, etc.)
