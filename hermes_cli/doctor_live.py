@@ -49,11 +49,37 @@ _LOCAL_AUDIO_PROVIDERS = {"", "local", "edge", "neutts", "kittentts", "piper"}
 
 @dataclass
 class ProbeResult:
-    """Outcome of one backend probe."""
+    """Outcome of one backend probe.
+
+    ``status`` names the stage that failed, not just that something did:
+
+    - ``pass``   the backend answered and the answer was good;
+    - ``warn``   inconclusive but not an outage (unconfigured key, throttled);
+    - ``fail``   the backend answered badly, or did not answer at all;
+    - ``broken`` this check never got a verdict out of the backend — a stale
+      endpoint, a malformed request, or a defect in the probe code. That is
+      news about us, not about the user's backend;
+    - ``skip``   nothing configured, nothing to probe.
+
+    ``fail`` and ``broken`` are kept apart deliberately. A red that fires on a
+    healthy backend is worse than no probe at all: it teaches the reader to
+    skip the whole section, and then a real outage goes unread.
+    """
 
     name: str
-    status: str  # "pass" | "warn" | "fail" | "skip"
+    status: str  # "pass" | "warn" | "fail" | "broken" | "skip"
     detail: str = ""
+
+
+# HTTP codes that mean the request we sent was wrong — the endpoint moved, was
+# retired, or we shaped the call badly. The backend is answering fine; the
+# probe is pointed at the wrong thing.
+_BROKEN_CHECK_CODES = frozenset({400, 404, 405, 410, 422})
+
+# Exception types that mean the probe code is defective rather than the backend
+# being unreachable. A network error is news; an AttributeError is a bug.
+_PROBE_DEFECT_ERRORS = (AttributeError, ImportError, NameError, TypeError,
+                        KeyError, IndexError)
 
 
 # ---------------------------------------------------------------------------
@@ -152,12 +178,25 @@ def _probe_mcp_server(name: str, config: dict, timeout: float):
 # ---------------------------------------------------------------------------
 
 def _classify_http(name: str, resp, key_hint: str) -> ProbeResult:
+    """Map an HTTP response to a verdict that names the stage that failed."""
     code = getattr(resp, "status_code", None)
-    if code is not None and 200 <= code < 300:
+    if not isinstance(code, int):
+        return ProbeResult(
+            name, "broken",
+            "(no HTTP response — the probe never reached a verdict)")
+    if 200 <= code < 300:
         return ProbeResult(name, "pass", f"(HTTP {code})")
     if code in (401, 403):
         return ProbeResult(name, "fail",
                            f"(HTTP {code} — check {key_hint})")
+    if code == 429:
+        # Reachable and authenticated, just throttled. Not an outage.
+        return ProbeResult(name, "warn", f"(HTTP {code} — rate limited)")
+    if code in _BROKEN_CHECK_CODES:
+        return ProbeResult(
+            name, "broken",
+            f"(HTTP {code} — this probe's endpoint or request is wrong, "
+            f"not the backend)")
     return ProbeResult(name, "fail", f"(HTTP {code})")
 
 
@@ -244,6 +283,14 @@ def _report(result: ProbeResult, issues: List[str]) -> None:
         check_ok(result.name, result.detail)
     elif result.status == "warn":
         check_warn(result.name, result.detail)
+    elif result.status == "broken":
+        # Surfaced, but never as evidence the backend is down — the remediation
+        # belongs on the probe, and the wording has to say so.
+        check_warn(result.name, result.detail)
+        issues.append(
+            f"Live probe for {result.name} could not reach a verdict "
+            f"{result.detail} — fix the probe or its config; this is not "
+            f"evidence that {result.name} is down")
     elif result.status == "fail":
         check_fail(result.name, result.detail)
         issues.append(f"Live probe failed: {result.name} {result.detail}")
@@ -258,6 +305,11 @@ def _run_one(name: str, fn: Callable[[], ProbeResult],
         result = fn()
     except TimeoutError as exc:
         result = ProbeResult(name, "fail", f"(timed out: {exc})")
+    except _PROBE_DEFECT_ERRORS as exc:
+        # The probe code is wrong; the backend never got a chance to answer.
+        result = ProbeResult(
+            name, "broken",
+            f"(probe defect: {type(exc).__name__}: {exc})")
     except Exception as exc:
         msg = str(exc) or exc.__class__.__name__
         if "time" in msg.lower():

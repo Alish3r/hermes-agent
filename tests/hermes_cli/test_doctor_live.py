@@ -366,3 +366,80 @@ class TestProbeEndpointsAuthenticate:
         results = {r.name: r for r in run_live_checks(issues)}
         assert results["FAL"].status == "fail"
         assert any("FAL" in i for i in issues)
+
+
+class TestBrokenCheckIsDistinctFromFailedBackend:
+    """A probe must say which stage failed.
+
+    'fail' means the backend answered and the answer was bad. 'broken' means
+    the probe never got a verdict out of the backend — a stale endpoint, a
+    malformed request, or a defect in the probe code itself. Collapsing the
+    second into the first reports our own bug as the user's outage, and a red
+    that fires on a healthy backend teaches the reader to ignore the section.
+    """
+
+    def _probe(self, status_code, monkeypatch):
+        monkeypatch.setenv("FIRECRAWL_API_KEY", "fc-test")
+        monkeypatch.setattr(
+            doctor_live, "_http_get",
+            lambda *a, **k: SimpleNamespace(status_code=status_code))
+        return {r.name: r for r in run_live_checks([])}["Firecrawl"]
+
+    @pytest.mark.parametrize("code", [200, 204])
+    def test_success_passes(self, code, monkeypatch):
+        assert self._probe(code, monkeypatch).status == "pass"
+
+    @pytest.mark.parametrize("code", [401, 403])
+    def test_rejected_credential_is_a_real_failure(self, code, monkeypatch):
+        assert self._probe(code, monkeypatch).status == "fail"
+
+    @pytest.mark.parametrize("code", [500, 502, 503])
+    def test_server_error_is_a_real_failure(self, code, monkeypatch):
+        assert self._probe(code, monkeypatch).status == "fail"
+
+    @pytest.mark.parametrize("code", [400, 404, 405, 410, 422])
+    def test_endpoint_or_request_wrong_is_a_broken_check(self, code, monkeypatch):
+        """A stale probe URL is our defect, not the backend's."""
+        assert self._probe(code, monkeypatch).status == "broken"
+
+    def test_rate_limited_is_a_warning_not_an_outage(self, monkeypatch):
+        """429 means reachable and authenticated, just throttled."""
+        assert self._probe(429, monkeypatch).status == "warn"
+
+    def test_no_response_object_is_a_broken_check(self, monkeypatch):
+        monkeypatch.setenv("FIRECRAWL_API_KEY", "fc-test")
+        monkeypatch.setattr(doctor_live, "_http_get", lambda *a, **k: object())
+        results = {r.name: r for r in run_live_checks([])}
+        assert results["Firecrawl"].status == "broken"
+
+    def test_probe_code_defect_is_broken_not_failed(self, monkeypatch):
+        """An AttributeError in the probe is a bug in us."""
+        def _boom(*a, **k):
+            raise AttributeError("'NoneType' object has no attribute 'get'")
+
+        monkeypatch.setenv("FIRECRAWL_API_KEY", "fc-test")
+        monkeypatch.setattr(doctor_live, "_http_get", _boom)
+        results = {r.name: r for r in run_live_checks([])}
+        assert results["Firecrawl"].status == "broken"
+
+    def test_timeout_remains_a_real_failure(self, monkeypatch):
+        """The backend genuinely did not answer — that is news about it."""
+        def _slow(*a, **k):
+            raise TimeoutError("timed out")
+
+        monkeypatch.setenv("FIRECRAWL_API_KEY", "fc-test")
+        monkeypatch.setattr(doctor_live, "_http_get", _slow)
+        results = {r.name: r for r in run_live_checks([])}
+        assert results["Firecrawl"].status == "fail"
+
+    def test_broken_check_issue_blames_the_probe_not_the_backend(self, monkeypatch):
+        monkeypatch.setenv("FIRECRAWL_API_KEY", "fc-test")
+        monkeypatch.setattr(
+            doctor_live, "_http_get",
+            lambda *a, **k: SimpleNamespace(status_code=404))
+        issues: list = []
+        run_live_checks(issues)
+        blamed = [i for i in issues if "Firecrawl" in i]
+        assert blamed, "a broken probe must still be surfaced"
+        assert not any("Live probe failed" in i for i in blamed), (
+            "a broken check must not be reported as a failed backend")
