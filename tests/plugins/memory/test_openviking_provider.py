@@ -1775,3 +1775,65 @@ class TestOpenVikingEnvWriter:
         assert env.read_text(encoding="utf-8").splitlines() == [
             "A=1", "OPENAI_API_KEY=new", "B=2",
         ]
+
+
+class TestHealthStatusNamesTheStage:
+    """``health()`` is a bool, so it cannot distinguish "the server is
+    unhealthy" from "this client could not tell". The old body swallowed every
+    exception into ``return False`` with no log line, so a defect in the probe
+    (an AttributeError, a missing import) was reported as the user's memory
+    backend being down, silently and indistinguishably.
+
+    ``health()`` keeps its boolean contract for existing callers; the stage is
+    available via ``health_status()`` and the swallowed path now logs.
+    """
+
+    def _client(self):
+        return _VikingClient("http://localhost:1", "key")
+
+    def test_healthy_server(self, monkeypatch):
+        client = self._client()
+        monkeypatch.setattr(
+            openviking_module, "_probe_openviking_identity",
+            lambda c: (openviking_module._OPENVIKING_IDENTITY_MODERN, {}))
+        assert client.health_status() == "healthy"
+        assert client.health() is True
+
+    def test_server_answers_but_is_not_openviking(self, monkeypatch):
+        client = self._client()
+        monkeypatch.setattr(
+            openviking_module, "_probe_openviking_identity",
+            lambda c: (openviking_module._OPENVIKING_IDENTITY_INVALID, {}))
+        assert client.health_status() == "unhealthy"
+        assert client.health() is False
+
+    def test_probe_that_cannot_reach_a_verdict_is_unknown(self, monkeypatch):
+        client = self._client()
+
+        def _boom(c):
+            raise AttributeError("'NoneType' object has no attribute 'get'")
+
+        monkeypatch.setattr(
+            openviking_module, "_probe_openviking_identity", _boom)
+        assert client.health_status() == "unknown"
+
+    def test_unknown_is_still_false_for_boolean_callers(self, monkeypatch):
+        """Backward compatible: callers gating on health() must not change."""
+        client = self._client()
+        monkeypatch.setattr(
+            openviking_module, "_probe_openviking_identity",
+            lambda c: (_ for _ in ()).throw(RuntimeError("connection refused")))
+        assert client.health() is False
+
+    def test_swallowed_failure_is_logged_not_silent(self, monkeypatch, caplog):
+        """The silence was the defect — a probe bug left no trace at all."""
+        import logging
+
+        client = self._client()
+        monkeypatch.setattr(
+            openviking_module, "_probe_openviking_identity",
+            lambda c: (_ for _ in ()).throw(AttributeError("probe bug")))
+        with caplog.at_level(logging.DEBUG, logger=openviking_module.__name__):
+            client.health_status()
+        assert any("health" in r.message.lower() for r in caplog.records), (
+            "a probe that could not reach a verdict must leave a trace")

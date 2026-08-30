@@ -148,6 +148,12 @@ _OPENVIKING_IDENTITY_LEGACY = "legacy"
 _OPENVIKING_IDENTITY_UNHEALTHY = "unhealthy"
 _OPENVIKING_IDENTITY_LEGACY_UNVERIFIED = "legacy-unverified"
 _OPENVIKING_IDENTITY_INVALID = "invalid"
+# Health verdicts. "unknown" exists so a probe that could not run is never
+# reported as a server that is down — see _VikingClient.health_status.
+_HEALTH_HEALTHY = "healthy"
+_HEALTH_UNHEALTHY = "unhealthy"
+_HEALTH_UNKNOWN = "unknown"
+
 _OPENVIKING_IDENTIFIED_STATES = frozenset({
     _OPENVIKING_IDENTITY_MODERN,
     _OPENVIKING_IDENTITY_LEGACY,
@@ -437,12 +443,36 @@ class _VikingClient:
             raise RuntimeError("OpenViking temp upload did not return temp_file_id")
         return temp_file_id
 
-    def health(self) -> bool:
+    def health_status(self) -> str:
+        """``'healthy'`` | ``'unhealthy'`` | ``'unknown'``.
+
+        ``'unknown'`` means this client never reached a verdict — the server
+        was not asked, or the probe raised before it could interpret an
+        answer. That is distinct from ``'unhealthy'``, which is the server
+        telling us something. Collapsing the two (as the bare
+        ``except Exception: return False`` below used to, without so much as a
+        log line) reports a defect in this client as the user's memory backend
+        being down — the one thing a health check must never do silently.
+        """
         try:
             identity, _health = _probe_openviking_identity(self)
-            return identity in _OPENVIKING_IDENTIFIED_STATES
         except Exception:
-            return False
+            logger.debug(
+                "OpenViking health probe did not reach a verdict", exc_info=True
+            )
+            return _HEALTH_UNKNOWN
+        if identity in _OPENVIKING_IDENTIFIED_STATES:
+            return _HEALTH_HEALTHY
+        return _HEALTH_UNHEALTHY
+
+    def health(self) -> bool:
+        """Boolean health for gating callers.
+
+        ``'unknown'`` is conservatively False: we will not claim a backend is
+        usable on the strength of a probe that failed to run. Callers needing
+        the distinction should use :meth:`health_status`.
+        """
+        return self.health_status() == _HEALTH_HEALTHY
 
     def _anonymous_json(self, path: str) -> dict:
         """Probe server identity without disclosing credentials or tenant IDs."""
