@@ -26,6 +26,57 @@ import pytest
 import cli
 
 
+class _FakeFuture:
+    def __init__(self, *, done=False):
+        self._done = done
+
+    def done(self):
+        return self._done
+
+
+class _DeferredLoop:
+    def __init__(self):
+        self.callback = None
+
+    def call_soon_threadsafe(self, callback):
+        self.callback = callback
+
+
+class _FakeApplication:
+    def __init__(self, *, done=False):
+        self.future = _FakeFuture(done=done)
+        self.loop = _DeferredLoop()
+        self.exit_calls = 0
+
+    def exit(self):
+        if self.future.done():
+            raise Exception("Return value already set. Application.exit() failed.")
+        self.exit_calls += 1
+        self.future._done = True
+
+
+class TestPromptToolkitSignalExit:
+    def test_pending_application_exits_on_loop_thread(self):
+        app = _FakeApplication()
+
+        assert cli._schedule_prompt_toolkit_exit(app) is True
+        assert app.exit_calls == 0
+        assert app.loop.callback is not None
+        app.loop.callback()
+
+        assert app.exit_calls == 1
+
+    def test_completed_application_is_not_exited_by_late_signal_callback(self):
+        app = _FakeApplication()
+
+        assert cli._schedule_prompt_toolkit_exit(app) is True
+        app.future._done = True  # app exits before the queued callback runs
+        assert app.loop.callback is not None
+        app.loop.callback()  # must not raise prompt_toolkit's duplicate-exit error
+
+        assert app.exit_calls == 0
+
+
 @pytest.fixture(autouse=True)
 def _reset_arm_flag(monkeypatch):
     """Each test starts with the idempotency flag clear."""

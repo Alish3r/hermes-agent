@@ -1182,6 +1182,30 @@ def _arm_exit_watchdog_on_shutdown_signal() -> None:
         pass  # never let the backstop break signal handling
 
 
+def _schedule_prompt_toolkit_exit(app) -> bool:
+    """Request one idempotent prompt-toolkit exit on its event-loop thread.
+
+    A termination signal can arrive after another shutdown path (for example,
+    SIGINT or ``/exit``) has already completed ``Application.future`` but before
+    process cleanup has returned.  Checking only when the callback is queued is
+    racy: the future can complete before the event loop executes it, and
+    prompt_toolkit then raises ``Return value already set`` from ``app.exit()``.
+    Inspect the future inside the callback so a late signal becomes a no-op.
+    """
+    loop = getattr(app, "loop", None)
+    if loop is None:
+        return False
+
+    def _exit_if_pending() -> None:
+        future = getattr(app, "future", None)
+        if future is None or future.done():
+            return
+        app.exit()
+
+    loop.call_soon_threadsafe(_exit_if_pending)
+    return True
+
+
 def _run_cleanup(*, notify_session_finalize: bool = True):
     """Run resource cleanup exactly once."""
     global _cleanup_done, _cleanup_in_progress
@@ -20407,9 +20431,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         try:
                             if not self.process_command(user_input):
                                 self._should_exit = True
-                                # Schedule app exit
-                                if app.is_running:
-                                    app.exit()
+                                # process_loop is a daemon thread; marshal the
+                                # exit onto prompt_toolkit's owning event loop.
+                                _schedule_prompt_toolkit_exit(app)
                         except KeyboardInterrupt:
                             # Ctrl+C during a slow slash command (e.g. /skills browse,
                             # /sessions list with a large DB) should interrupt the
@@ -20642,11 +20666,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             try:
                 from prompt_toolkit.application.current import get_app_or_none
                 _app = get_app_or_none()
-                if _app is not None:
-                    _loop = getattr(_app, "loop", None)
-                    if _loop is not None:
-                        _loop.call_soon_threadsafe(_app.exit)
-                        return  # clean unwind — no traceback, no ENTER pause
+                if _app is not None and _schedule_prompt_toolkit_exit(_app):
+                    return  # clean unwind — no traceback, no ENTER pause
             except Exception:
                 pass
             raise KeyboardInterrupt()  # fallback for non-prompt_toolkit contexts
@@ -21653,7 +21674,10 @@ def main(
                 # invocations are fast.
                 _query_label = query or ("[image attached]" if single_query_images else "")
                 if _query_label:
-                    cli.console.print(f"[bold blue]Query:[/] {_query_label}")
+                    # The prompt is user input, not Rich markup.  Escaping it
+                    # prevents bracketed URLs and other literal text from
+                    # being parsed as unmatched formatting tags.
+                    cli.console.print(f"[bold blue]Query:[/] {_escape(_query_label)}")
                 # Surface security advisories before the agent runs — short
                 # banner, doesn't depend on the welcome banner being shown.
                 cli._show_security_advisories()
