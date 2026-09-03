@@ -32,6 +32,12 @@ _NAMES_ONLY_LINE_RE = re.compile(r"^  .+ \[names only\]: (?P<names>.+)$")
 # Cap the human-readable "Skills by size" table; ``--json`` always has them all.
 _SKILLS_TABLE_LIMIT = 20
 
+# Marker ``prompt_builder._truncate_content`` leaves inside a context file it
+# cut; the numbers in it are the builder's own accounting for that file.
+_TRUNCATION_MARKER_RE = re.compile(
+    r"\[\.\.\.truncated (?P<name>.+?): kept \d+\+\d+ of (?P<total>\d+) chars\."
+)
+
 
 def _bytes(s: str) -> int:
     return len(s.encode("utf-8"))
@@ -232,6 +238,61 @@ def _compute_toolsets_breakdown(tools: List[Any]) -> List[Dict[str, Any]]:
     return out
 
 
+def context_file_truncation(chars: int, cap_chars: int) -> Dict[str, Any]:
+    """Pure mirror of the ``prompt_builder._truncate_content`` arithmetic.
+
+    For a context file of ``chars`` chars under an effective cap of
+    ``cap_chars``, report whether the builder cuts it and how many chars
+    survive in the head and tail slices versus how many are dropped from the
+    middle. The ratios are imported from the builder so the two never drift.
+    """
+    from agent.prompt_builder import (
+        CONTEXT_TRUNCATE_HEAD_RATIO,
+        CONTEXT_TRUNCATE_TAIL_RATIO,
+    )
+
+    if chars <= cap_chars:
+        return {"truncated": False, "kept_head": chars, "kept_tail": 0, "dropped": 0}
+    kept_head = int(cap_chars * CONTEXT_TRUNCATE_HEAD_RATIO)
+    kept_tail = int(cap_chars * CONTEXT_TRUNCATE_TAIL_RATIO)
+    return {
+        "truncated": True,
+        "kept_head": kept_head,
+        "kept_tail": kept_tail,
+        "dropped": chars - kept_head - kept_tail,
+    }
+
+
+def _model_context_length(agent: Any) -> Optional[int]:
+    """The context window the prompt builder used for this agent, or None.
+
+    Mirrors ``build_system_prompt_parts``: the window is read from the agent's
+    context compressor, so the cap reported here is the cap the builder
+    actually applied to the context files.
+    """
+    compressor = getattr(agent, "context_compressor", None)
+    length = getattr(compressor, "context_length", None)
+    if isinstance(length, int) and not isinstance(length, bool) and length > 0:
+        return length
+    return None
+
+
+def _find_context_truncations(context: str, cap_chars: int) -> List[Dict[str, Any]]:
+    """Context files the builder cut, read from the markers it left in the tier.
+
+    The context tier is measured *after* truncation, so its size alone cannot
+    reveal a cut; the marker carries the file's real size, and the head/tail
+    split is re-derived from it with :func:`context_file_truncation`.
+    """
+    found: List[Dict[str, Any]] = []
+    for match in _TRUNCATION_MARKER_RE.finditer(context):
+        total = int(match.group("total"))
+        entry: Dict[str, Any] = {"file": match.group("name"), "chars": total}
+        entry.update(context_file_truncation(total, cap_chars))
+        found.append(entry)
+    return found
+
+
 def compute_prompt_breakdown(platform: str = "cli") -> Dict[str, Any]:
     """Return a dict of prompt-size measurements for a fresh session.
 
@@ -241,6 +302,8 @@ def compute_prompt_breakdown(platform: str = "cli") -> Dict[str, Any]:
     (per-skill index-line + on-disk SKILL.md bytes, largest-first), and
     ``toolsets_breakdown`` (per-toolset tool count + schema json bytes,
     largest-first). The last two answer "what should I disable to cut tokens?".
+    ``context_files`` carries the effective context-file cap for this model and
+    any context file the builder truncated on the way in.
     """
     from agent.system_prompt import build_system_prompt, build_system_prompt_parts
 
@@ -284,6 +347,19 @@ def compute_prompt_breakdown(platform: str = "cli") -> Dict[str, Any]:
         ("volatile (memory/profile/timestamp)", len(volatile), _bytes(volatile)),
     ]
 
+    # Effective context-file cap: what prompt_builder applied to AGENTS.md and
+    # friends for this model, plus any file it had to cut to fit.
+    from agent.prompt_builder import CONTEXT_FILE_MAX_CHARS, _get_context_file_max_chars
+
+    context_length = _model_context_length(agent)
+    cap_chars = _get_context_file_max_chars(context_length)
+    context_files = {
+        "cap_chars": cap_chars,
+        "floor_chars": CONTEXT_FILE_MAX_CHARS,
+        "context_length": context_length,
+        "truncated": _find_context_truncations(context, cap_chars),
+    }
+
     return {
         "platform": platform,
         "model": getattr(agent, "model", "") or "",
@@ -295,11 +371,35 @@ def compute_prompt_breakdown(platform: str = "cli") -> Dict[str, Any]:
         "sections": sections,
         "skills_breakdown": _compute_skills_breakdown(skills_index),
         "toolsets_breakdown": _compute_toolsets_breakdown(tools),
+        "context_files": context_files,
     }
 
 
 def _fmt_kb(n: int) -> str:
     return f"{n / 1024:.1f} KB"
+
+
+def _render_context_cap(info: Optional[Dict[str, Any]]) -> List[str]:
+    """Lines shown under the context tier: the effective cap and any cut file."""
+    if not info:
+        return []
+    cap = info["cap_chars"]
+    length = info.get("context_length")
+    if length:
+        origin = f"model context length {length:,} tokens"
+    else:
+        origin = (
+            f"model context length unknown; {info.get('floor_chars', cap):,}-char "
+            "floor unless context_file_max_chars is set"
+        )
+    lines = [f"      context-file cap                  : {cap:>8,} chars  ({origin})"]
+    for cut in info.get("truncated") or []:
+        lines.append(
+            f"      TRUNCATED {cut['file']}: {cut['chars']:,} chars > cap; "
+            f"{cut['dropped']:,} chars dropped "
+            f"(kept {cut['kept_head']:,} head + {cut['kept_tail']:,} tail)"
+        )
+    return lines
 
 
 def render_breakdown(data: Dict[str, Any]) -> str:
@@ -321,6 +421,8 @@ def render_breakdown(data: Dict[str, Any]) -> str:
     lines.append("  Prompt tiers:")
     for label, chars, byts in data["sections"]:
         lines.append(f"    {label:<36}: {byts:>8,} B  ({_fmt_kb(byts)})")
+        if label.startswith("context"):
+            lines.extend(_render_context_cap(data.get("context_files")))
     lines.append("")
     tools = data["tools"]
     lines.append(f"  Tool schemas         : {tools['json_bytes']:>8,} B  ({_fmt_kb(tools['json_bytes'])}, {tools['count']} tools)")
