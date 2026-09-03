@@ -1,9 +1,10 @@
 """Thinking-timeout detection and user-facing guidance for reasoning models.
 
 When a known reasoning model (NVIDIA Nemotron 3 Ultra, OpenAI o1/o3,
-Anthropic Opus 4.x thinking, DeepSeek R1, Qwen QwQ, xAI Grok reasoning)
-hits a transport-layer error before the first content token arrives, the
-upstream proxy has almost certainly idle-killed a long thinking stream —
+Anthropic Opus 4.x thinking, DeepSeek R1, Moonshot Kimi K2/K3, Qwen
+QwQ, xAI Grok reasoning) hits a transport-layer error before the first
+content token arrives, the upstream proxy has almost certainly
+idle-killed a long thinking stream —
 not a true context overflow or a configuration error.  The user needs
 distinct guidance for this case:
 
