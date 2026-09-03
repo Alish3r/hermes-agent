@@ -8,6 +8,7 @@ from unittest.mock import patch, MagicMock
 
 import pytest
 
+import agent.anthropic_adapter as anthropic_adapter
 from agent.prompt_caching import apply_anthropic_cache_control
 from agent.anthropic_adapter import (
     _is_azure_anthropic_endpoint,
@@ -27,6 +28,69 @@ from agent.anthropic_adapter import (
     run_oauth_setup_token,
 )
 from agent.transports import get_transport
+
+
+# ---------------------------------------------------------------------------
+# Lazy SDK loading
+# ---------------------------------------------------------------------------
+
+
+def test_anthropic_sdk_import_retries_after_previous_miss(monkeypatch):
+    """A package installed after a failed switch is visible without a restart."""
+    fake_sdk = SimpleNamespace()
+    monkeypatch.setitem(sys.modules, "anthropic", fake_sdk)
+    monkeypatch.setattr(anthropic_adapter, "_anthropic_sdk", None)
+    monkeypatch.setattr(anthropic_adapter, "_anthropic_sdk_unavailable_reason", "earlier miss")
+
+    assert anthropic_adapter._get_anthropic_sdk() is fake_sdk
+    assert anthropic_adapter._anthropic_sdk_unavailable_reason is None
+
+
+def test_anthropic_sdk_success_is_cached_and_not_reimported(monkeypatch):
+    """Once loaded, the module is served from the cache: no import per call."""
+    cached = SimpleNamespace(name="cached")
+    monkeypatch.setattr(anthropic_adapter, "_anthropic_sdk", cached)
+    monkeypatch.setitem(sys.modules, "anthropic", SimpleNamespace(name="other"))
+
+    assert anthropic_adapter._get_anthropic_sdk() is cached
+
+
+def test_anthropic_sdk_miss_keeps_the_lazy_installer_reason(monkeypatch):
+    """When the lazy installer declines (policy) and the import fails, the
+    user-facing hint carries the installer's reason, the exact interpreter and
+    the canonical pin instead of a generic pip line."""
+    import tools.lazy_deps as lazy_deps
+
+    def refuse(feature, *, prompt=True):
+        raise lazy_deps.FeatureUnavailable(
+            feature, ("anthropic==0.87.0",),
+            "lazy installs disabled by security.allow_lazy_installs",
+        )
+
+    monkeypatch.setattr(lazy_deps, "ensure", refuse)
+    monkeypatch.setattr(anthropic_adapter, "_anthropic_sdk", ...)
+    monkeypatch.setattr(anthropic_adapter, "_anthropic_sdk_unavailable_reason", None)
+    monkeypatch.setitem(sys.modules, "anthropic", None)  # makes `import anthropic` raise ImportError
+
+    assert anthropic_adapter._get_anthropic_sdk() is None
+    hint = anthropic_adapter.anthropic_sdk_install_hint("the Anthropic provider")
+    assert "security.allow_lazy_installs" in hint
+    assert sys.executable in hint
+    assert "anthropic==" in hint
+    assert "the Anthropic provider" in hint
+
+
+def test_build_anthropic_client_error_names_the_interpreter(monkeypatch):
+    """The provider-level ImportError is the actionable hint, not a bare pip line."""
+    monkeypatch.setattr(anthropic_adapter, "_get_anthropic_sdk", lambda: None)
+    monkeypatch.setattr(anthropic_adapter, "_anthropic_sdk_unavailable_reason", "install failed: no network")
+
+    with pytest.raises(ImportError) as excinfo:
+        anthropic_adapter.build_anthropic_client("sk-test", base_url=None)
+
+    message = str(excinfo.value)
+    assert sys.executable in message
+    assert "no network" in message
 
 
 # ---------------------------------------------------------------------------

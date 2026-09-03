@@ -13,6 +13,7 @@ Auth supports:
 import copy
 import json
 import logging
+import sys
 import os
 import platform
 import re
@@ -129,26 +130,75 @@ except Exception:
 # paths. Access via the `_get_anthropic_sdk()` accessor below, which caches
 # the module after the first call and returns None on ImportError.
 _anthropic_sdk: Any = ...  # sentinel — None means "tried and missing"
+# Why the SDK could not be made available on the last miss (the lazy
+# installer's own reason when it declined or failed, else the ImportError
+# text). Surfaced by anthropic_sdk_install_hint() so users see the real cause
+# instead of a generic "pip install" line. None once the import succeeds.
+_anthropic_sdk_unavailable_reason: Optional[str] = None
+_ANTHROPIC_SDK_FEATURE = "provider.anthropic"
+_ANTHROPIC_SDK_FALLBACK_PIN = "anthropic==0.87.0"  # mirrors tools.lazy_deps.LAZY_DEPS
+
+
+def _anthropic_sdk_pin() -> str:
+    """Canonical pin for the SDK, read from the lazy-deps registry so the
+    install hint cannot drift from what ``hermes update`` would install."""
+    try:
+        from tools.lazy_deps import LAZY_DEPS
+        specs = LAZY_DEPS.get(_ANTHROPIC_SDK_FEATURE) or ()
+        for spec in specs:
+            if str(spec).startswith("anthropic"):
+                return str(spec)
+    except Exception:
+        pass
+    return _ANTHROPIC_SDK_FALLBACK_PIN
 
 
 def _get_anthropic_sdk():
-    """Return the ``anthropic`` SDK module, importing lazily. None if not installed."""
-    global _anthropic_sdk
+    """Return the ``anthropic`` SDK module, importing lazily. None if not installed.
+
+    The lazy installer runs once per process (first call); the plain import is
+    retried on every later call, so a package installed after a failed
+    provider switch becomes visible without restarting Hermes. The reason for
+    the last miss is kept in ``_anthropic_sdk_unavailable_reason``.
+    """
+    global _anthropic_sdk, _anthropic_sdk_unavailable_reason
+    if _anthropic_sdk is not ... and _anthropic_sdk is not None:
+        return _anthropic_sdk
+    ensure_reason: Optional[str] = None
     if _anthropic_sdk is ...:
         try:
             from tools.lazy_deps import ensure as _lazy_ensure
-            _lazy_ensure("provider.anthropic", prompt=False)
+            _lazy_ensure(_ANTHROPIC_SDK_FEATURE, prompt=False)
         except ImportError:
-            pass
-        except Exception:
-            # FeatureUnavailable — fall through to ImportError handling below
-            pass
-        try:
-            import anthropic as _sdk
-            _anthropic_sdk = _sdk
-        except ImportError:
-            _anthropic_sdk = None
+            pass  # lazy_deps itself unavailable; fall through to a plain import
+        except Exception as exc:
+            # FeatureUnavailable: installs disabled by policy, or the install
+            # failed. Keep its reason; do not let it mask the import below.
+            ensure_reason = getattr(exc, "reason", None) or str(exc)
+    try:
+        import anthropic as _sdk
+    except ImportError as exc:
+        _anthropic_sdk = None
+        _anthropic_sdk_unavailable_reason = ensure_reason or _anthropic_sdk_unavailable_reason or str(exc)
+        return None
+    _anthropic_sdk = _sdk
+    _anthropic_sdk_unavailable_reason = None
     return _anthropic_sdk
+
+
+def anthropic_sdk_install_hint(context: str) -> str:
+    """One actionable sentence for a missing SDK: what needs it, the exact
+    interpreter Hermes runs under (a plain ``pip`` often targets another
+    Python), the canonical pin, and why the lazy installer did not act."""
+    hint = (
+        f"The 'anthropic' package is required for {context}. "
+        f"Install it into Hermes's own interpreter: "
+        f"{sys.executable} -m pip install '{_anthropic_sdk_pin()}'"
+    )
+    reason = _anthropic_sdk_unavailable_reason
+    if reason:
+        hint += f" (automatic install did not happen: {reason})"
+    return hint
 
 logger = logging.getLogger(__name__)
 
@@ -650,10 +700,9 @@ def _build_anthropic_client_with_bearer_hook(
     """
     _anthropic_sdk = _get_anthropic_sdk()
     if _anthropic_sdk is None:
-        raise ImportError(
-            "The 'anthropic' package is required for Azure Foundry Anthropic-style "
-            "endpoints with Entra ID auth. Install with: pip install 'anthropic>=0.39.0'"
-        )
+        raise ImportError(anthropic_sdk_install_hint(
+            "Azure Foundry Anthropic-style endpoints with Entra ID auth"
+        ))
 
     normalize_proxy_env_vars()
 
@@ -741,10 +790,7 @@ def build_anthropic_client(
     """
     _anthropic_sdk = _get_anthropic_sdk()
     if _anthropic_sdk is None:
-        raise ImportError(
-            "The 'anthropic' package is required for the Anthropic provider. "
-            "Install it with: pip install 'anthropic>=0.39.0'"
-        )
+        raise ImportError(anthropic_sdk_install_hint("the Anthropic provider"))
 
     # Callable api_key → Entra ID bearer provider path. Delegated to a
     # helper so the existing static-key code below stays unchanged.
@@ -879,14 +925,11 @@ def build_anthropic_bedrock_client(region: str):
     """
     _anthropic_sdk = _get_anthropic_sdk()
     if _anthropic_sdk is None:
-        raise ImportError(
-            "The 'anthropic' package is required for the Bedrock provider. "
-            "Install it with: pip install 'anthropic>=0.39.0'"
-        )
+        raise ImportError(anthropic_sdk_install_hint("the Bedrock provider"))
     if not hasattr(_anthropic_sdk, "AnthropicBedrock"):
         raise ImportError(
-            "anthropic.AnthropicBedrock not available. "
-            "Upgrade with: pip install 'anthropic>=0.39.0'"
+            "anthropic.AnthropicBedrock not available. Upgrade with: "
+            f"{sys.executable} -m pip install '{_anthropic_sdk_pin()}'"
         )
     from httpx import Timeout
 
