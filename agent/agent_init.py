@@ -67,6 +67,53 @@ logger = logging.getLogger("run_agent")
 _warned_unavailable_providers: set[str] = set()
 
 
+def _allows_explicit_small_local_context(agent: Any) -> bool:
+    """Return whether an explicitly opted-in local provider may use <64K.
+
+    Hermes normally rejects small windows because unrestricted agent sessions
+    need room for tools, history, and compaction. A user-owned local route can
+    opt in only when its configured, real window is explicit and the endpoint
+    is local/private. The matching provider entry must declare
+    ``allow_below_minimum_context: true``; this makes a low-context router a
+    deliberate deployment choice rather than a silent global weakening.
+    """
+    compressor = getattr(agent, "context_compressor", None)
+    configured = getattr(compressor, "context_length", None)
+    if configured is None:
+        configured = getattr(agent, "_config_context_length", None)
+    if (
+        isinstance(configured, bool)
+        or not isinstance(configured, int)
+        or configured <= 0
+        or configured >= MINIMUM_CONTEXT_LENGTH
+        or not is_local_endpoint(str(getattr(agent, "base_url", "") or ""))
+    ):
+        return False
+
+    target = normalize_route_base_url(str(getattr(agent, "base_url", "") or ""))
+    if not target:
+        return False
+
+    providers = getattr(agent, "_custom_providers", None) or []
+    # AIAgent does not retain the route catalog. Gateway and CLI startup
+    # resolve it separately, so use the same readonly config as a fallback.
+    if not providers:
+        try:
+            from hermes_cli.config import get_compatible_custom_providers, load_config_readonly
+
+            providers = get_compatible_custom_providers(load_config_readonly())
+        except Exception:
+            return False
+
+    for entry in providers:
+        if not isinstance(entry, dict):
+            continue
+        if normalize_route_base_url(str(entry.get("base_url") or "")) != target:
+            continue
+        return entry.get("allow_below_minimum_context") is True
+    return False
+
+
 def _warn_memory_provider_unavailable(name: str, reason: str = "") -> None:
     """Warn (once per provider) when a configured memory provider is unavailable.
 
@@ -2928,7 +2975,13 @@ def init_agent(
         and not isinstance(agent._config_context_length, bool)
         and agent._config_context_length > 0
     )
-    if _ctx and _ctx < MINIMUM_CONTEXT_LENGTH and not _allow_lmstudio_explicit_below_floor:
+    _allow_explicit_small_local_context = _allows_explicit_small_local_context(agent)
+    if (
+        _ctx
+        and _ctx < MINIMUM_CONTEXT_LENGTH
+        and not _allow_lmstudio_explicit_below_floor
+        and not _allow_explicit_small_local_context
+    ):
         raise ValueError(
             f"Model {agent.model} has a context window of {_ctx:,} tokens, "
             f"which is below the minimum {MINIMUM_CONTEXT_LENGTH:,} required "

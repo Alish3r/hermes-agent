@@ -650,6 +650,19 @@ def _ollama_context_limit_error(agent: Any, request_tokens: int) -> Optional[str
     if runtime_ctx >= MINIMUM_CONTEXT_LENGTH:
         return None
 
+    # A deliberately opted-in local custom provider may operate below the
+    # normal 64K floor only while the actual request stays inside its reserved
+    # safe envelope. This keeps the global safety invariant for normal
+    # sessions and prevents a constrained router from silently overflowing.
+    try:
+        from agent.agent_init import _allows_explicit_small_local_context
+
+        small_local_allowed = _allows_explicit_small_local_context(agent)
+    except Exception:
+        small_local_allowed = False
+    if small_local_allowed and request_tokens <= int(runtime_ctx * 0.75):
+        return None
+
     model = getattr(agent, "model", "") or "the selected model"
     base_url = getattr(agent, "base_url", "") or "unknown base URL"
     provider = getattr(agent, "provider", "") or "unknown"
