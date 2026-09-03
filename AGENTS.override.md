@@ -66,6 +66,12 @@ scripts/run_tests.sh tests/agent/test_foo.py -k test_x # file + -k; the runner i
 - Desktop slash palette: curation hides terminal-only/messaging-only built-ins, never skill or `quick_commands` extensions (`isDesktopSlashExtensionCommand` must flow into both completion paths). Do not rebuild the chat transcript/composer in React for the dashboard; extend Ink.
 - Skill authoring standards are HARDLINE: `description` ≤ 60 chars, name native Hermes tools not shell utilities, `platforms:` audited against imports, human contributor credited first, modern section order, scripts under `scripts/`, tests at `tests/skills/test_<skill>_skill.py`. Full checklist: the `hermes-agent-skill-authoring` skill.
 
+## Local checkout conventions (this machine)
+
+- This checkout follows `origin/main` (NousResearch) from the branch `local/alisher`. Commit local adaptations on `local/alisher`, never on `main`: `hermes update` hard-resets a diverged `main` but merges `origin/main` into a custom branch. Do not open PRs against NousResearch from here.
+- Keep this file under 20,000 chars (the Hermes floor cap; `hermes prompt-size` does not warn when it is exceeded) and any per-directory `AGENTS.md` under 8,000 chars (the lazy-hint cap; `apps/desktop/AGENTS.md` already exceeds it and is cut when loaded). Check with `wc -m AGENTS.override.md`.
+- Hermes and Codex load this file instead of `AGENTS.md`; Claude Code loads it through `CLAUDE.md` (`@AGENTS.override.md`). The full `AGENTS.md` stays untouched so upstream updates merge cleanly.
+
 ## Routing table: read before editing
 
 | Working in | Read |
