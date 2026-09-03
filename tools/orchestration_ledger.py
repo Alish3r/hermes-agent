@@ -43,6 +43,11 @@ _ALLOWED_TRANSITIONS = {
     "retained_diagnostic": set(),
     "reaped": set(),
 }
+# States with no outgoing transition: the lifecycle is closed and later
+# transport evidence can never move the allocation again.
+CLOSED_STATES = frozenset(
+    state for state, successors in _ALLOWED_TRANSITIONS.items() if not successors
+)
 
 
 class LedgerError(RuntimeError):

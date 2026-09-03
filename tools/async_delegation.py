@@ -464,7 +464,7 @@ def _converge_ledger_completion(event: Dict[str, Any], result: Dict[str, Any]) -
     # The transport row is durable attempted-work evidence. The allocation
     # receipt below is the sole lifecycle oracle and can fail closed if a
     # parent tries to finish while descendants remain active/unreconciled.
-    from tools.orchestration_ledger import OrchestrationLedger
+    from tools.orchestration_ledger import CLOSED_STATES, OrchestrationLedger
 
     ledger = OrchestrationLedger(_db_path())
 
@@ -474,6 +474,16 @@ def _converge_ledger_completion(event: Dict[str, Any], result: Dict[str, Any]) -
         status: str,
     ) -> dict[str, Any]:
         allocation = ledger.get(allocation_id)
+        if allocation["state"] in CLOSED_STATES:
+            # The ledger already closed this lifecycle (fenced after its owner
+            # vanished, or reaped). Its verdict stands: transport evidence
+            # arriving later — or replayed on every startup — is a no-op, not
+            # a fault, so it must not raise or warn.
+            logger.debug(
+                "Allocation %s is already %s; transport evidence (%s) not replayed",
+                allocation_id, allocation["state"], status,
+            )
+            return allocation
         success = status in {"completed", "success"}
         receipt_result = {
             "summary": child_result.get("summary"),
@@ -511,22 +521,25 @@ def _converge_ledger_completion(event: Dict[str, Any], result: Dict[str, Any]) -
             )
         return terminal
 
+    allocation_id = str(event.get("allocation_id") or event["delegation_id"])
     batch_results = result.get("results")
     if event.get("is_batch") and isinstance(batch_results, list):
         for index, child_result in enumerate(batch_results):
             if not isinstance(child_result, dict):
                 child_result = {"status": "error", "error": "malformed child result"}
-            child_id = str(
-                child_result.get("allocation_id")
-                or f"{event['delegation_id']}_{index}"
-            )
+            # Batch children are allocated by position at dispatch
+            # (_persist_dispatch: "<parent>_<index>"). Derive the child id the
+            # same way instead of trusting the runner's payload: a single-task
+            # batch stamps its child with the parent's own id, and finalizing
+            # the parent here (while its real child is still live) fails
+            # closed, loses the receipt, and gets the pair fenced on the next
+            # restart.
             _finalize_one(
-                child_id,
+                f"{allocation_id}_{index}",
                 child_result,
                 str(child_result.get("status") or "error"),
             )
 
-    allocation_id = str(event.get("allocation_id") or event["delegation_id"])
     terminal = _finalize_one(
         allocation_id,
         result,

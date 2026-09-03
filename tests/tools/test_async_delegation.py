@@ -6,6 +6,7 @@ formatting, capacity rejection, and crash handling.
 """
 
 import json
+import logging
 import os
 import queue
 import sqlite3
@@ -457,6 +458,108 @@ def test_restart_recovery_converges_terminal_transport_evidence(monkeypatch, tmp
     assert OrchestrationLedger(db_path).get("deleg_crash_gap")["state"] == "running"
     ad.recover_abandoned_delegations()
     assert OrchestrationLedger(db_path).get("deleg_crash_gap")["state"] == "reaped"
+
+
+def test_single_task_batch_completion_reaps_its_positional_child(monkeypatch, tmp_path):
+    """A one-goal batch labels its lone child with the parent's own id (that is
+    how delegate_task stamps an n_tasks == 1 child). The ledger allocated a
+    positional "<parent>_0" child for it regardless, so the completion must
+    finalize that child and then the parent — never the parent twice, which
+    fails closed on the still-live child and loses the receipt."""
+    db_path = tmp_path / "state.db"
+    monkeypatch.setattr(ad, "_db_path", lambda: db_path)
+    record = {
+        "delegation_id": "deleg_solo_batch",
+        "session_key": "parent",
+        "parent_session_id": "parent",
+        "status": "running",
+        "dispatched_at": time.time(),
+        "is_batch": True,
+        "goals": ["only task"],
+    }
+    ad._persist_dispatch(record)
+    results = [
+        {"task_index": 0, "status": "completed", "summary": "done",
+         "child_session_id": "child-solo", "allocation_id": "deleg_solo_batch"},
+    ]
+    ad._persist_completion(
+        {**record, "status": "completed", "completed_at": time.time()},
+        {"status": "completed", "summary": "done", "results": results},
+    )
+
+    from tools.orchestration_ledger import OrchestrationLedger
+
+    ledger = OrchestrationLedger(db_path)
+    assert ledger.get("deleg_solo_batch_0")["state"] == "reaped"
+    assert ledger.get("deleg_solo_batch")["state"] == "reaped"
+
+
+def test_restart_replay_leaves_closed_allocations_silent(monkeypatch, tmp_path, caplog):
+    """Once the ledger has fenced an allocation (owner vanished -> unknown ->
+    retained_diagnostic) its verdict is final. Replaying the row's durable
+    "completed" transport evidence at startup must neither warn nor move the
+    allocation — otherwise every boot logs one warning per fenced row forever."""
+    db_path = tmp_path / "state.db"
+    monkeypatch.setattr(ad, "_db_path", lambda: db_path)
+    record = {
+        "delegation_id": "deleg_fenced",
+        "session_key": "parent",
+        "parent_session_id": "parent",
+        "status": "running",
+        "dispatched_at": time.time(),
+        "goal": "fenced",
+    }
+    ad._persist_dispatch(record)
+    result = {"status": "completed", "summary": "late", "child_session_id": "child"}
+    event = {
+        **record,
+        "type": "async_delegation",
+        "status": "completed",
+        "completed_at": time.time(),
+        "allocation_id": "deleg_fenced",
+    }
+    with ad._transaction() as conn:
+        conn.execute(
+            """UPDATE async_delegations SET state='completed', event_json=?, result_json=?,
+                      completed_at=?, updated_at=? WHERE delegation_id=?""",
+            (json.dumps(event), json.dumps(result), time.time(), time.time(), "deleg_fenced"),
+        )
+
+    from tools.orchestration_ledger import OrchestrationLedger
+
+    ledger = OrchestrationLedger(db_path)
+    unknown = ledger.transition(
+        "deleg_fenced",
+        expected_generation=int(ledger.get("deleg_fenced")["generation"]),
+        operation_id="recover-stale:deleg_fenced:1",
+        new_state="unknown",
+        event={"kind": "stale_owner"},
+        updates={
+            "task_state": "unknown",
+            "terminal_reason": "owner_identity_lost",
+            "resource_state": "retained",
+        },
+    )
+    fenced = ledger.transition(
+        "deleg_fenced",
+        expected_generation=int(unknown["generation"]),
+        operation_id="retain-stale:deleg_fenced:2",
+        new_state="retained_diagnostic",
+        event={"kind": "resource_retained", "reason": "owner_identity_lost"},
+        updates={"resource_state": "retained"},
+    )
+
+    with caplog.at_level(logging.DEBUG, logger="tools.async_delegation"):
+        ad.recover_abandoned_delegations()
+
+    noisy = [
+        r for r in caplog.records
+        if r.name == "tools.async_delegation" and r.levelno >= logging.WARNING
+    ]
+    assert noisy == []
+    after = ledger.get("deleg_fenced")
+    assert after["state"] == "retained_diagnostic"
+    assert after["generation"] == fenced["generation"]
 
 
 def test_failed_batch_child_is_retained_while_successful_sibling_reaps(monkeypatch, tmp_path):
