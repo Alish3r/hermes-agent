@@ -62,6 +62,7 @@ scripts/run_tests.sh tests/agent/test_foo.py -k test_x # file + -k; the runner i
 
 - This checkout follows `origin/main` (NousResearch) from the branch `local/alisher`. Commit local adaptations on `local/alisher`, never on `main`: `hermes update` hard-resets a diverged `main` but merges `origin/main` into a custom branch. Do not open PRs against NousResearch from here.
 - Keep this file under 20,000 chars (the Hermes floor cap; `hermes prompt-size` does not warn when it is exceeded) and any per-directory `AGENTS.md` under 8,000 chars (the lazy-hint cap; upstream's `apps/desktop/AGENTS.md` exceeds it, which is why `apps/desktop/AGENTS.override.md` exists and is picked first). Check with `wc -m AGENTS.override.md`.
+- Coding-only sessions in this repo run in the `dev` Hermes profile (`dev chat`): lean toolset, same auth and skills. `delegate_task` children inherit the parent's toolsets, so a lean subagent needs a lean parent or a `hermes -p dev chat --oneshot -Q -q "<task>"` spawn.
 - Hermes and Codex load this file instead of `AGENTS.md`; Claude Code loads it through `CLAUDE.md` (`@AGENTS.override.md`). The full `AGENTS.md` stays untouched so upstream updates merge cleanly.
 
 ## Routing table: read before editing
