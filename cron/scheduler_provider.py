@@ -20,6 +20,7 @@ selected via the `cron.provider` config key (empty = built-in).
 from __future__ import annotations
 
 import inspect
+import logging
 import threading
 from abc import ABC, abstractmethod
 from pathlib import Path
@@ -88,6 +89,8 @@ def _existing_profile_homes(profile_homes: list) -> list:
         if Path(home).is_dir():
             live.append(entry)
     return live
+
+logger = logging.getLogger(__name__)
 
 
 class CronScheduler(ABC):
@@ -161,8 +164,24 @@ class CronScheduler(ABC):
     def recover_interrupted(self) -> int:
         """Run profile-local attempt recovery for every provider lifecycle."""
         from cron.executions import recover_interrupted_executions
+        from governance import recover_open_routes
 
-        return recover_interrupted_executions()
+        # Both ledgers are profile-local. A provider startup/recovery boundary
+        # is the first point after a crash where no prior process still owns a
+        # route, so recover both before new work can be accepted. The route
+        # ledger is advisory for cron: its failure must never stop the
+        # scheduler from starting, and its count is reported apart because
+        # callers log the return value as interrupted cron executions.
+        recovered = recover_interrupted_executions()
+        try:
+            routes = recover_open_routes()
+            if routes:
+                logger.info("Recovered %d abandoned delegated route(s) as unknown", routes)
+        except Exception as exc:
+            logger.warning(
+                "Governance route recovery failed; cron recovery continues: %s", exc
+            )
+        return recovered
 
     @property
     def supports_force_fire(self) -> bool:
@@ -205,27 +224,52 @@ class CronScheduler(ABC):
         external scheduler, then pass the exact owner-bearing snapshot to
         ``fire_claimed`` in tracked background work.
         """
-        from cron.executions import create_execution, finish_execution
+        from cron.executions import (
+            UnknownExecutionBlocked,
+            create_execution,
+            execution_is_blocked,
+            recover_interrupted_executions,
+            terminalize_unstarted_execution,
+        )
         from cron.jobs import claim_job_for_fire
 
-        execution = create_execution(job_id, source=self.name)
+        # A fire can arrive long after startup recovery. Classify attempts
+        # whose owner died since then before consulting the fence, so a
+        # crashed attempt cannot be followed by a duplicate run.
+        try:
+            from governance import recover_open_routes
+
+            recover_interrupted_executions()
+            recover_open_routes()
+        except Exception as reap_exc:
+            logger.debug("Stale execution reclaim failed: %s", reap_exc)
+
+        # Do this before either durable claim or execution creation.  The
+        # external-provider path must not bypass the same unknown-outcome gate
+        # that the built-in ticker enforces.
+        if execution_is_blocked(job_id):
+            return None
+        try:
+            execution = create_execution(job_id, source=self.name)
+        except UnknownExecutionBlocked:
+            # The shared admission transaction is authoritative.  A recovery
+            # may have committed an unknown state after this method's early
+            # preflight, so treat the race exactly like a blocked preflight.
+            return None
         claim_kwargs = {"return_job": True}
         if force:
             claim_kwargs["force"] = True
         try:
             claimed_job = claim_job_for_fire(job_id, **claim_kwargs)
         except BaseException as exc:
-            finish_execution(
+            terminalize_unstarted_execution(
                 execution["id"],
-                success=False,
                 error=f"Fire claim failed before dispatch: {type(exc).__name__}: {exc}",
             )
             raise
         if not isinstance(claimed_job, dict):
-            finish_execution(
-                execution["id"],
-                success=False,
-                error="Fire claim was not acquired",
+            terminalize_unstarted_execution(
+                execution["id"], error="Fire claim was not acquired"
             )
             return None
         claimed_job["execution_id"] = execution["id"]
@@ -455,8 +499,15 @@ def fire_overdue_jobs(
             # fine), then run the job off-thread so the caller's loop is
             # never blocked for the length of an agent run.
             claimed = provider.claim_fire(job_id)
-            if claimed is None:
-                continue
+        except Exception as exc:
+            logger.warning(
+                "Misfire catch-up failed for job %s: %s: %s",
+                job_id, type(exc).__name__, exc,
+            )
+            continue
+        if claimed is None:
+            continue
+        try:
             threading.Thread(
                 target=provider.fire_claimed,
                 args=(claimed,),
@@ -470,6 +521,34 @@ def fire_overdue_jobs(
                 "Misfire catch-up failed for job %s: %s: %s",
                 job_id, type(exc).__name__, exc,
             )
+            # The attempt was admitted by claim_fire before the worker could
+            # start; leaving it claimed would turn it into an unknown fence at
+            # the next restart although no run body ever ran.
+            execution_id = claimed.get("execution_id") if isinstance(claimed, dict) else None
+            if execution_id:
+                from cron.executions import terminalize_unstarted_execution
+
+                terminalize_unstarted_execution(
+                    str(execution_id),
+                    error=f"Misfire catch-up could not start its worker: {type(exc).__name__}: {exc}",
+                )
+            # Same for the fire claim: nothing ran, so hand it back under its
+            # owner fence instead of parking the job until the claim TTL —
+            # the next housekeeping pass (or an external retry) can then
+            # claim it. Best-effort; a failed release leaves the TTL backstop.
+            _claim = claimed.get("fire_claim") if isinstance(claimed, dict) else None
+            _owner = _claim.get("by") if isinstance(_claim, dict) else None
+            if _owner:
+                try:
+                    from cron.jobs import release_fire_claim
+
+                    release_fire_claim(job_id, expected_owner=str(_owner))
+                except Exception:
+                    logger.debug(
+                        "Misfire catch-up could not release the fire claim for job %s",
+                        job_id,
+                        exc_info=True,
+                    )
     return fired
 
 

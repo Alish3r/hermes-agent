@@ -726,6 +726,7 @@ from cron.jobs import (
     use_cron_store,
 )
 from cron.executions import (
+    UnknownExecutionBlocked,
     _TERMINAL_STATES,
     create_execution,
     finish_execution,
@@ -733,6 +734,9 @@ from cron.executions import (
     mark_execution_handoff_pending,
     mark_execution_running,
     recover_interrupted_executions,
+    execution_is_blocked,
+    take_pre_admitted_execution,
+    terminalize_unstarted_execution,
 )
 
 # Sentinel: when a cron agent has nothing new to report, it can start its
@@ -7430,7 +7434,22 @@ def run_one_job(
     # API fires) crosses this seam.  Ensure the detached worker has a durable
     # attempt to adopt before any launch can occur.
     if not job.get("execution_id"):
-        execution = create_execution(job["id"], source="direct")
+        # A manual run admits its attempt before taking the store claim and
+        # hands it over on this thread; adopt that attempt rather than
+        # admitting a second one.  Direct callers without one admit here.
+        execution = take_pre_admitted_execution(job["id"])
+        if execution is None:
+            try:
+                execution = create_execution(job["id"], source="direct")
+            except UnknownExecutionBlocked:
+                # A direct caller may have passed its best-effort preflight
+                # just before recovery committed an unknown prior attempt. The
+                # shared admission gate is authoritative; do not crash or run.
+                logger.warning(
+                    "Job '%s' refused: an earlier execution outcome became unknown during admission",
+                    job.get("name", job["id"]),
+                )
+                return False
         job["execution_id"] = execution["id"]
 
     execution_id = str(job["execution_id"])
@@ -8769,7 +8788,18 @@ def tick(
             # Acquire the durable claim only when this worker actually starts,
             # not while it may wait behind other work in an executor queue.
             # This prevents a queued lease from expiring before execution.
-            claimed = claim_job_for_fire(job["id"], return_job=True)
+            try:
+                claimed = claim_job_for_fire(job["id"], return_job=True)
+            except Exception as claim_exc:
+                # The attempt was admitted before this worker started. A
+                # jobs-file failure here must not leave it claimed by a live
+                # process: it would become an unknown fence at the next restart
+                # although no run body ever started.
+                terminalize_unstarted_execution(
+                    job["execution_id"],
+                    error=f"Fire claim failed before dispatch: {type(claim_exc).__name__}: {claim_exc}",
+                )
+                raise
             if not claimed:
                 finish_execution(
                     job["execution_id"],
@@ -8831,6 +8861,18 @@ def tick(
                         job.get("name", job_id),
                         claim_err,
                     )
+
+            if execution_is_blocked(job_id):
+                logger.warning(
+                    "Job '%s' refused: an earlier execution outcome is unknown; "
+                    "reconcile it (hermes cron reconcile) before resuming",
+                    job.get("name", job_id),
+                )
+                # get_due_jobs already stamped a one-shot run_claim; release
+                # it like every other refused dispatch so reconciliation is
+                # not followed by a claim-TTL wait.
+                _clear_run_claim_best_effort()
+                return None
 
             # A tick can race gateway teardown: once the interpreter is
             # finalizing, ``pool.submit`` raises "cannot schedule new futures

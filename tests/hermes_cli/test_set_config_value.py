@@ -6,6 +6,7 @@ import os
 from unittest.mock import patch
 
 import pytest
+import yaml
 
 from hermes_cli.config import (
     config_command,
@@ -547,6 +548,7 @@ class TestValidateConfigKey:
         "platforms.discord.enabled",
         "gateway.platforms.my_platform.extra.token",
         "approvals.mode",
+        "delegation.route_allow_list",
     ])
     def test_known_keys_pass(self, key):
         from hermes_cli.config import _validate_config_key
@@ -573,6 +575,56 @@ class TestValidateConfigKey:
         from hermes_cli.config import _validate_config_key
         is_known, suggestion = _validate_config_key("agent._max_turns")
         assert not is_known, "Sub-key typo under a known top-level key must still be flagged"
+
+
+class TestDelegationRouteAllowList:
+    """``delegation.route_allow_list`` is the executor's route policy.
+
+    Absent/``None`` keeps the historical allow-by-default behavior; a list of
+    ``provider:model`` strings is an allow-list.  The reader in
+    ``tools/delegate_tool.py`` gates on ``isinstance(value, list)`` and treats
+    any other populated type as malformed (fail closed: every route refused),
+    so ``hermes config set`` must recognize the key and store a list literal
+    as a real YAML list, never as a string.  The default must stay ``None``,
+    not ``[]``: an empty list would refuse every delegated route.
+    """
+
+    @staticmethod
+    def _fresh_load_config(monkeypatch):
+        import hermes_cli.config as cfg
+        from hermes_cli import managed_scope
+
+        monkeypatch.delenv("HERMES_MANAGED_DIR", raising=False)
+        cfg._LOAD_CONFIG_CACHE.clear()
+        cfg._RAW_CONFIG_CACHE.clear()
+        managed_scope.invalidate_managed_cache()
+        return cfg.load_config()
+
+    def test_default_is_none_meaning_allow_by_default(self, monkeypatch):
+        merged = self._fresh_load_config(monkeypatch)
+        assert "route_allow_list" in merged["delegation"]
+        assert merged["delegation"]["route_allow_list"] is None
+
+    def test_list_literal_round_trips_as_list(self, _isolated_hermes_home, monkeypatch, capsys):
+        routes = ["openrouter:anthropic/claude-sonnet-4.5", "openai:gpt-5"]
+        set_config_value("delegation.route_allow_list", json.dumps(routes))
+        assert "not a recognized config key" not in capsys.readouterr().out
+
+        raw = yaml.safe_load(_read_config(_isolated_hermes_home))
+        assert raw["delegation"]["route_allow_list"] == routes
+
+        merged = self._fresh_load_config(monkeypatch)
+        assert merged["delegation"]["route_allow_list"] == routes
+
+    def test_null_restores_allow_by_default(self, _isolated_hermes_home, monkeypatch):
+        set_config_value("delegation.route_allow_list", '["openai:gpt-5"]')
+        set_config_value("delegation.route_allow_list", "null")
+
+        raw = yaml.safe_load(_read_config(_isolated_hermes_home))
+        assert raw["delegation"].get("route_allow_list") is None
+
+        merged = self._fresh_load_config(monkeypatch)
+        assert merged["delegation"]["route_allow_list"] is None
 
 
 # ---------------------------------------------------------------------------

@@ -3818,6 +3818,42 @@ def _heartbeat_fire_claim_locked(job_id: str, *, expected_owner: str) -> bool:
     return False
 
 
+def release_fire_claim(job_id: str, *, expected_owner: str) -> bool:
+    """Hand back an owner's ``fire_claim`` for a fire that never ran.
+
+    ``mark_job_run`` is the normal way a claim is cleared, but it also records
+    a run result (``last_run_at``/``last_status``/``failure_streak``) — wrong
+    for a fire that was claimed and then refused before the run body started:
+    a manual run whose in-flight dedupe (``try_register_running_job``) lost to
+    a ticker that registered first, or a misfire catch-up whose worker thread
+    could not start. Left in place, such a claim blocks every other fire —
+    including the ticker's own, which claims AFTER registering — until the
+    claim TTL expires, so nobody runs the job for up to 300 s.
+
+    Owner-fenced like ``_mark_job_run_locked``: only a claim whose ``by``
+    equals ``expected_owner`` is cleared, so a stale caller can never drop a
+    claim another process has since taken. Touches ``fire_claim`` only;
+    ``next_run_at``, ``last_*`` and ``run_claim`` stay exactly as they are.
+    Returns True when the claim was cleared, False when the job is missing,
+    carries no claim, or the claim belongs to someone else.
+    """
+    with _fire_job_lock(job_id) as acquired:
+        if not acquired:
+            return False
+        with _jobs_lock():
+            jobs = load_jobs()
+            for job in jobs:
+                if job.get("id") != job_id:
+                    continue
+                claim = job.get("fire_claim")
+                if not isinstance(claim, dict) or claim.get("by") != expected_owner:
+                    return False
+                job["fire_claim"] = None
+                save_jobs(jobs)
+                return True
+    return False
+
+
 def get_due_jobs() -> List[Dict[str, Any]]:
     """Get all jobs that are due to run now.
 

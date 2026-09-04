@@ -313,7 +313,22 @@ hermes cron pause <job_id>          # Pause a running job
 hermes cron resume <job_id>         # Resume a paused job
 hermes cron run <job_id>            # Trigger immediate execution
 hermes cron remove <job_id>         # Delete a job
+hermes cron reconcile <job_id> [execution_id]  # Acknowledge unknown attempt(s), lifting the run fence
 ```
+
+**Unknown-execution fence.** Every claimed attempt is recorded in the
+profile-local `~/.hermes/cron/executions.db` with its owner PID and
+process-start fingerprint. When an owner dies before writing a durable
+terminal state, the attempt is classified `unknown` — by
+`recover_interrupted_executions` at recovery time or, at the latest, inside
+the next admission check (`create_execution`, the shared boundary every
+executor passes through) — and any unacknowledged `unknown` row fences the
+job: new claims raise `UnknownExecutionBlocked` instead of running. The
+fence is lifted only by `hermes cron reconcile`, which writes an
+`execution_reconciliations` row per acknowledged attempt (job-level
+acknowledges all remaining unknown attempts; an execution id acknowledges
+exactly that one and fails closed otherwise). Retention never lifts the
+fence: unacknowledged unknown rows are excluded from pruning.
 
 ## Related Docs
 

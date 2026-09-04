@@ -2219,6 +2219,15 @@ DEFAULT_CONFIG = {
         # Set to true to restore delivery of child process notifications
         # (with subagent attribution lines).
         "surface_child_process_notifications": False,
+        # Executor route policy for delegated children (see
+        # tools/delegate_tool.py:_get_route_allow_list). A list of
+        # "provider:model" strings (or two-item [provider, model] pairs)
+        # is an allow-list: children may only run on routes named here.
+        # null/absent (default) = allow-by-default, the historical behavior.
+        # Keep the default null, NOT []: an empty list refuses every route.
+        # Any other populated type is malformed and fails closed (all routes
+        # refused) so a child can never pick its own authorization.
+        "route_allow_list": None,
     },
 
     # Ephemeral prefill messages file — JSON list of {role, content} dicts

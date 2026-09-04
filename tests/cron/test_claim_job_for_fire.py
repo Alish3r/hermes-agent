@@ -263,3 +263,51 @@ def test_same_thread_fire_fence_reentrancy_preserves_ownership(temp_home):
     assert result == {"outer": True, "inner": True}
     thread.join(timeout=2)
     assert thread.is_alive() is False
+
+
+def test_release_fire_claim_clears_only_the_matching_owner(temp_home):
+    """A fire that was claimed but never ran hands its claim back WITHOUT
+    recording a run: the claim goes, every other field stays, and the job is
+    claimable again at once instead of after the claim TTL."""
+    import cron.jobs as jobs
+
+    job = jobs.create_job(prompt="x", schedule="every 5m", name="release")
+    jid = job["id"]
+    claimed = jobs.claim_job_for_fire(jid, return_job=True)
+    assert isinstance(claimed, dict)
+    owner = claimed["fire_claim"]["by"]
+    before = jobs.get_job(jid)
+
+    assert jobs.release_fire_claim(jid, expected_owner=owner) is True
+
+    after = jobs.get_job(jid)
+    assert after.get("fire_claim") is None
+    for field in (
+        "next_run_at", "last_run_at", "last_status", "last_error",
+        "failure_streak", "run_claim", "enabled", "state",
+    ):
+        assert after.get(field) == before.get(field), field
+    assert jobs.claim_job_for_fire(jid) is True
+
+
+def test_release_fire_claim_refuses_a_different_owner(temp_home):
+    """Owner-fenced like mark_job_run: a stale caller cannot drop a claim
+    another process has since taken."""
+    import cron.jobs as jobs
+
+    job = jobs.create_job(prompt="x", schedule="every 5m", name="release-fenced")
+    claimed = jobs.claim_job_for_fire(job["id"], return_job=True)
+    original = dict(claimed["fire_claim"])
+
+    assert jobs.release_fire_claim(job["id"], expected_owner="replacement-owner") is False
+    assert jobs.get_job(job["id"])["fire_claim"] == original
+    assert jobs.claim_job_for_fire(job["id"]) is False
+
+
+def test_release_fire_claim_without_a_claim_returns_false(temp_home):
+    import cron.jobs as jobs
+
+    job = jobs.create_job(prompt="x", schedule="every 5m", name="release-none")
+    assert jobs.release_fire_claim(job["id"], expected_owner="anyone") is False
+    assert jobs.get_job(job["id"]).get("fire_claim") is None
+    assert jobs.release_fire_claim("nope-does-not-exist", expected_owner="anyone") is False

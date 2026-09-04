@@ -209,6 +209,7 @@ Subagents inherit the parent's enabled toolsets. `delegate_task` does not accept
 |--------|---------|-------|--------|
 | `max_concurrent_children` | 3 | >=1 | Parallel batch size per `delegate_task` call |
 | `max_spawn_depth` | 1 | >=1 | How many delegation levels can spawn further |
+| `route_allow_list` | null | list or null | Exact `provider:model` routes children may run on; `null` allows every route |
 
 Example: running 30 parallel workers with nested subagents:
 
@@ -221,6 +222,7 @@ delegation:
 - **Separate terminals** — each subagent gets its own terminal session with separate working directory and state
 - **No conversation history** — subagents see only the `goal` and `context` the parent agent passes when calling `delegate_task`
 - **Default 50 iterations** — set `max_iterations` lower for simple tasks to save cost
+- **Routes can be pinned** — `delegation.route_allow_list` limits children to the exact provider/model pairs it names (as `"provider:model"` strings, `[provider, model]` pairs, or `{provider, model}` mappings) and prunes each child's fallback chain to that list. A child on an unlisted route returns a failed result with `route.status: refused`, recorded in `~/.hermes/governance/routes.db`. Leave the key `null` for the default allow-everything behavior; `[]` or a non-list value refuses every route.
 - **Not durable** — top-level delegation runs in the background and posts its result back later, but it remains tied to the owning session and Hermes process. Session closure, `/stop`, `/new`, or a process restart can cancel or strand in-progress work. Use `cronjob` or `terminal(background=True, notify_on_complete=True)` for work that must survive those boundaries.
 
 ---

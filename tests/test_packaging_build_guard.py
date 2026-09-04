@@ -80,6 +80,11 @@ def test_artifact_build_allows_explicit_nix_package_build_marker(kind, artifact_
         for path in (PROJECT_ROOT / "plugins").rglob(pattern)
     }
     assert expected, "expected bundled plugin manifests under plugins/"
+    # Top-level packages outside plugins/ that runtime code imports
+    # unconditionally. tools/delegate_tool.py imports `governance` at module
+    # load, so an artifact that omits it breaks `import tools.delegate_tool`
+    # in every installed (non-editable) environment.
+    expected.add("governance/__init__.py")
 
     if kind == "wheel":
         with zipfile.ZipFile(artifacts[0]) as wheel:
@@ -93,4 +98,4 @@ def test_artifact_build_allows_explicit_nix_package_build_marker(kind, artifact_
             }
 
     missing = sorted(expected - shipped)
-    assert not missing, f"{kind} omits bundled plugin manifests: {missing}"
+    assert not missing, f"{kind} omits bundled runtime files: {missing}"

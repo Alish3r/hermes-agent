@@ -22,6 +22,35 @@ def tmp_cron_dir(tmp_path, monkeypatch):
 
 class TestCronCommandLifecycle:
 
+    def test_reconcile_unknown_execution_requires_exact_ack(self, monkeypatch, capsys):
+        calls = []
+
+        def acknowledge(job_id, execution_id=None):
+            calls.append((job_id, execution_id))
+            return True
+
+        monkeypatch.setattr(cron_cli, "cron_reconcile_unknown", acknowledge)
+        rc = cron_command(
+            Namespace(
+                cron_command="reconcile",
+                job_id="job-unknown",
+                execution_id="execution-unknown",
+            )
+        )
+
+        assert rc == 0
+        assert calls == [("job-unknown", "execution-unknown")]
+        assert "future runs are unblocked" in capsys.readouterr().out
+
+    def test_reconcile_unknown_execution_fails_closed(self, monkeypatch, capsys):
+        monkeypatch.setattr(cron_cli, "cron_reconcile_unknown", lambda *_: False)
+        rc = cron_command(
+            Namespace(cron_command="reconcile", job_id="job-unknown", execution_id="wrong")
+        )
+
+        assert rc == 1
+        assert "Reconciliation refused" in capsys.readouterr().out
+
     def test_edit_persists_user_owned_inference_pins(self, tmp_cron_dir, capsys):
         job = create_job(prompt="Daily report", schedule="every 1h")
         parser = argparse.ArgumentParser(prog="hermes")
@@ -586,3 +615,18 @@ class TestSlashCronListLastStatus:
 
         out = self._run_list(tmp_cron_dir, capsys)
         assert "(ok)" in out
+
+
+class TestCronReconcileMessages:
+    def test_reconcile_reports_attempts_that_still_fence_the_job(self, monkeypatch, capsys):
+        monkeypatch.setattr(cron_cli, "cron_reconcile_unknown", lambda *_: True)
+        monkeypatch.setattr(cron_cli, "cron_job_is_fenced", lambda _job_id: True, raising=False)
+
+        rc = cron_command(
+            Namespace(cron_command="reconcile", job_id="job-unknown", execution_id="one-of-two")
+        )
+
+        out = capsys.readouterr().out
+        assert rc == 0
+        assert "still" in out
+        assert "unblocked" not in out

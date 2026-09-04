@@ -366,6 +366,47 @@ _INCIDENT_STATE_COLORS = {
 }
 
 
+def cron_reconcile_unknown(job_id: str, execution_id: Optional[str] = None) -> bool:
+    """Explicit code-level acknowledgement that clears an unknown-run block."""
+    from cron.executions import acknowledge_unknown_execution
+
+    return acknowledge_unknown_execution(job_id, execution_id)
+
+
+def cron_job_is_fenced(job_id: str) -> bool:
+    """Whether unacknowledged unknown attempts still refuse runs of ``job_id``."""
+    from cron.executions import execution_is_blocked
+
+    return execution_is_blocked(job_id)
+
+
+def cron_reconcile(args) -> int:
+    """Clear an unknown-run block only after an explicit operator action."""
+    job_id = str(getattr(args, "job_id", "") or "")
+    execution_id = getattr(args, "execution_id", None)
+    if not job_id:
+        print(color("✗ Job ID required for reconciliation.", Colors.RED))
+        return 1
+    if cron_reconcile_unknown(job_id, execution_id):
+        if cron_job_is_fenced(job_id):
+            print(color(
+                f"✓ Acknowledged unknown execution {execution_id} for job {job_id}; "
+                "other unknown attempt(s) still fence this job. Reconcile them too.",
+                Colors.YELLOW,
+            ))
+        else:
+            print(color(
+                f"✓ Reconciled unknown execution for job {job_id}; future runs are unblocked.",
+                Colors.GREEN,
+            ))
+        return 0
+    print(color(
+        "✗ Reconciliation refused: no matching unacknowledged unknown attempt for this job.",
+        Colors.RED,
+    ))
+    return 1
+
+
 def cron_incidents(args) -> int:
     """List or acknowledge durable cron failure incidents.
 
@@ -1077,6 +1118,9 @@ def cron_command(args):
         cron_runs(getattr(args, "job_id", None), getattr(args, "limit", 20))
         return 0
 
+    if subcmd == "reconcile":
+        return cron_reconcile(args)
+
     if subcmd == "incidents":
         return cron_incidents(args)
 
@@ -1102,5 +1146,5 @@ def cron_command(args):
         return _job_action("remove", args.job_id, "Removed")
 
     print(f"Unknown cron command: {subcmd}")
-    print("Usage: hermes cron [list|create|edit|pause|resume|run|remove|status|runs|doctor|tick]")
+    print("Usage: hermes cron [list|create|edit|pause|resume|run|remove|status|runs|reconcile|doctor|tick]")
     sys.exit(1)

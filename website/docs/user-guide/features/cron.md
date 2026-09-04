@@ -252,6 +252,7 @@ hermes cron remove <job_id_or_name>
 hermes cron edit <job_id_or_name> [...flags]
 hermes cron status
 hermes cron tick
+hermes cron reconcile <job_id> [execution_id]
 ```
 
 What they do:
@@ -333,6 +334,27 @@ automatically rerun.
 Inspect recent attempts with `hermes cron runs [job-id] --limit 20` (alias:
 `history`). Terminal history is bounded; active attempts are never pruned. The
 ledger is included in quick backups.
+
+### Reconciling an unknown execution
+
+An `unknown` attempt is a safety fence, not just history: because Hermes
+cannot tell whether the dead process already ran the job's side effects
+(sent the message, pushed the commit, charged the card), the job refuses
+every new run — scheduled or manual — until an operator acknowledges it.
+Check what the attempt actually did, then clear the fence:
+
+```bash
+hermes cron runs <job_id>                        # find the unknown attempt(s)
+hermes cron reconcile <job_id>                   # acknowledge every remaining unknown attempt
+hermes cron reconcile <job_id> <execution_id>    # acknowledge only that attempt
+```
+
+The job-level form says you have reviewed the job's side effects as a
+whole; the execution-id form acknowledges one attempt and fails closed if
+the id is not an unacknowledged unknown attempt of that job. Runs resume
+once no unacknowledged unknown attempt remains — reconciling never reruns
+the attempt, and an unacknowledged unknown attempt is never pruned from
+the ledger.
 
 ### Repeated-failure review nudge
 

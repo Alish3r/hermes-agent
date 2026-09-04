@@ -488,6 +488,31 @@ directory, on docker/ssh/modal backends, or if worktree creation fails, the
 setting degrades silently to today's shared-workspace behavior — never an
 error.
 
+## Route Allow-List
+
+By default a child may run on whatever provider/model the delegation
+settings (or the parent) resolve to. Set `delegation.route_allow_list` to
+pin delegated work to an exact set of routes:
+
+```yaml
+delegation:
+  route_allow_list:                      # default: null (every route allowed)
+    - "openrouter:google/gemini-3-flash-preview"
+    - [openrouter, anthropic/claude-sonnet-4]   # two-item pair form
+    - {provider: anthropic, model: claude-sonnet-4}
+```
+
+Matching is exact (no case folding or trimming), and an entry that does not
+name both a provider and a model is ignored. Before a governed child runs,
+its inherited fallback chain is pruned to the list, so it can only fall
+back onto routes the list admits. A child whose route is not listed never
+starts: it returns a failed result whose `route.status` is `refused`, and
+the refusal is recorded in the profile-local ledger
+`~/.hermes/governance/routes.db` (route facts only — no prompt or task
+content). Leave the key `null` rather than `[]`, and keep it a list: an
+empty list refuses every route, and a malformed non-list value fails
+closed the same way with an error logged.
+
 ## Delegation vs execute_code
 
 | Factor | delegate_task | execute_code |
@@ -512,6 +537,7 @@ delegation:
   # worktree_isolation: false               # Give each child its own git worktree (see Worktree Isolation above)
   # max_spawn_depth: 1                      # Tree depth (floor 1, no ceiling, default 1 = flat). Raise to 2 to allow orchestrator children to spawn leaves; 3+ for deeper trees.
   # orchestrator_enabled: true              # Disable to force all children to leaf role.
+  # route_allow_list: null                  # Exact provider:model routes children may run on; null = all (see Route Allow-List above)
   model: "google/gemini-3-flash-preview"             # Optional provider/model override
   provider: "openrouter"                             # Optional built-in provider
   api_mode: anthropic_messages                       # optional; auto-detected from base_url for anthropic_messages endpoints

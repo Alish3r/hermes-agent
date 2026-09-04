@@ -302,6 +302,16 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
     cron_runs.add_argument("job_id", nargs="?", help="Optional job ID filter")
     cron_runs.add_argument("--limit", type=int, default=20, help="Rows to show (1-500)")
 
+    # cron reconcile — operator acknowledgement for an unknown execution.
+    cron_reconcile = cron_subparsers.add_parser(
+        "reconcile", help="Acknowledge a job's unknown execution(s) after checking their side effects"
+    )
+    cron_reconcile.add_argument("job_id", help="Job ID whose unknown attempt(s) were checked")
+    cron_reconcile.add_argument(
+        "execution_id", nargs="?",
+        help="Optional exact unknown execution ID: acknowledge only that attempt (fails closed if it is not one)",
+    )
+
     # cron incidents — durable failure incidents (list/ack)
     cron_incidents = cron_subparsers.add_parser(
         "incidents", help="List or acknowledge durable cron failure incidents"

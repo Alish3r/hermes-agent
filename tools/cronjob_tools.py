@@ -964,6 +964,32 @@ def _execute_job_now(
     Returns {"claimed": bool, "success": bool, "error": str|None}.
     """
     job_id = job["id"]
+    # A stateless caller (`hermes cron run` with no async delivery) reaches
+    # this path without the background path's self-heal, so an attempt whose
+    # owner died would still look admissible until some scheduler classified
+    # it. Classify provably abandoned attempts first; the fence sees them.
+    try:
+        from cron.executions import recover_interrupted_executions
+        from governance import recover_open_routes
+
+        recover_interrupted_executions()
+        recover_open_routes()
+    except Exception as _reap_exc:
+        logger.debug("Stale execution reclaim failed: %s", _reap_exc)
+    # Manual/direct execution shares the unknown-outcome gate with built-in
+    # and external schedulers. Check before claiming so a blocked attempt does
+    # not advance a schedule or create new side effects.
+    from cron.executions import execution_is_blocked
+
+    if execution_is_blocked(job_id):
+        return _unknown_execution_refusal()
+    # Admit the attempt through the atomic gate BEFORE the store claim (the
+    # same order the ticker and external providers use): recovery may commit
+    # an unknown prior attempt after the preflight above, and a refusal must
+    # not consume the fire claim or advance the schedule.
+    admitted = _admit_manual_attempt(job_id)
+    if admitted is None:
+        return _unknown_execution_refusal()
     claimed_job = None
     try:
         # At-most-once claim: bail without running if a tick/other fire owns it.
@@ -980,20 +1006,73 @@ def _execute_job_now(
                 reason = "Job is paused/disabled; resume it before running."
             else:
                 reason = "Job is already being fired by the scheduler; not run again."
+            _terminalize_admitted_attempt(
+                admitted, f"Fire claim was not acquired: {reason}"
+            )
             return {"claimed": False, "success": False, "error": reason}
     except Exception as e:
         logger.error("Failed to claim cron job %s for immediate run: %s", job_id, e)
+        _terminalize_admitted_attempt(
+            admitted, f"Fire claim failed before dispatch: {type(e).__name__}: {e}"
+        )
         try:
             mark_job_run(job_id, False, str(e))
         except Exception:
             pass
         return {"claimed": True, "success": False, "error": str(e)}
 
-    return _run_claimed_job(claimed_job, extra_prompt=extra_prompt)
+    return _run_claimed_job(claimed_job, extra_prompt=extra_prompt, admitted=admitted)
+
+
+def _unknown_execution_refusal() -> Dict[str, Any]:
+    """Result shape for a run refused by the unknown-outcome fence."""
+    return {
+        "claimed": False,
+        "success": False,
+        "error": (
+            "An earlier execution of this job ended with an unknown outcome; "
+            "reconcile it (hermes cron reconcile <job_id>) before running this "
+            "job again."
+        ),
+    }
+
+
+def _admit_manual_attempt(job_id: str) -> Optional[Dict[str, Any]]:
+    """Durably admit a manual attempt, or ``None`` when the atomic gate refuses."""
+    from cron.executions import UnknownExecutionBlocked, create_execution
+
+    try:
+        return create_execution(job_id, source="direct")
+    except UnknownExecutionBlocked:
+        logger.warning(
+            "Job '%s' refused: an earlier execution outcome became unknown during admission",
+            job_id,
+        )
+        return None
+
+
+def _terminalize_admitted_attempt(
+    admitted: Optional[Dict[str, Any]], error: str
+) -> bool:
+    """Never strand an admitted attempt the run body did not start.
+
+    Only a still-``claimed`` attempt is failed; one the run body already
+    owns is left alone so a later crash surfaces as ``unknown``. Returns
+    whether the attempt is terminal afterwards (see
+    ``cron.executions.terminalize_unstarted_execution``).
+    """
+    if not admitted:
+        return True
+    from cron.executions import terminalize_unstarted_execution
+
+    return terminalize_unstarted_execution(admitted["id"], error=error)
 
 
 def _run_claimed_job(
-    job: Dict[str, Any], extra_prompt: Optional[str] = None
+    job: Dict[str, Any],
+    extra_prompt: Optional[str] = None,
+    *,
+    admitted: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Fire an already-claimed job through the shared ``run_one_job`` body.
 
@@ -1002,12 +1081,19 @@ def _run_claimed_job(
     the tool response can report "paused"/"already firing" immediately — and
     hand the actual run to a daemon worker.
 
+    ``admitted`` is the attempt the caller admitted before taking the claim.
+    It is offered to the run body on this thread: ``run_one_job`` adopts it
+    first thing instead of admitting a second attempt, and records it on the
+    snapshot as ``execution_id``. It is terminalized here on the paths that
+    never start the run body, and best-effort if the run body raises.
+
     Returns {"claimed": True, "success": bool, "error": str|None}.
     """
     job_id = job["id"]
     _registered = False
     fire_owner = None
     try:
+        from cron.executions import pre_admitted_execution
         from cron.scheduler import (
             release_running_job,
             run_one_job,
@@ -1022,14 +1108,33 @@ def _run_claimed_job(
         # makes this run visible to the gateway shutdown drain
         # (get_running_job_ids, #60432) and mark_running_jobs_interrupted.
         if not try_register_running_job(job_id):
-            return {
-                "claimed": True,
-                "success": False,
-                "error": (
-                    "Job is already running (a scheduler tick or another "
-                    "manual run is executing it); not started again."
-                ),
-            }
+            _already_running = (
+                "Job is already running (a scheduler tick or another "
+                "manual run is executing it); not started again."
+            )
+            _terminalize_admitted_attempt(admitted, _already_running)
+            # This run took the fire claim (claim_job_for_fire in the caller)
+            # but never reaches mark_job_run, the only other thing that clears
+            # it. Hand the claim back under its owner fence: the ticker that
+            # registered first claims AFTER registering, so a stranded claim
+            # makes it lose too and nobody runs the job until the 300s TTL.
+            # Best-effort — a failed release just means the TTL backstop
+            # applies as before.
+            _claim = job.get("fire_claim")
+            _owner = str(_claim.get("by") or "") if isinstance(_claim, dict) else ""
+            if _owner:
+                try:
+                    from cron.jobs import release_fire_claim
+
+                    release_fire_claim(job_id, expected_owner=_owner)
+                except Exception:
+                    logger.debug(
+                        "Could not release the fire claim for job %s after the "
+                        "in-flight dedupe refused it",
+                        job_id,
+                        exc_info=True,
+                    )
+            return {"claimed": True, "success": False, "error": _already_running}
         _registered = True
 
         claim = job.get("fire_claim")
@@ -1113,10 +1218,11 @@ def _run_claimed_job(
 
         try:
             try:
-                processed = run_one_job(
-                    job, adapters=adapters, loop=gateway_loop,
-                    extra_prompt=extra_prompt,
-                )
+                with pre_admitted_execution(admitted):
+                    processed = run_one_job(
+                        job, adapters=adapters, loop=gateway_loop,
+                        extra_prompt=extra_prompt,
+                    )
             finally:
                 _heartbeat_stop.set()
                 if _heartbeat_thread is not None:
@@ -1156,6 +1262,8 @@ def _run_claimed_job(
 
     except Exception as e:
         logger.error("Failed to execute cron job %s immediately: %s", job_id, e)
+        # No-op when the run body already terminalized the adopted attempt.
+        _terminalize_admitted_attempt(admitted, str(e))
         if _registered:
             # Registration succeeded but we raised before the run's own
             # release ran (e.g. heartbeat setup) — don't leave the job
@@ -1258,6 +1366,7 @@ def _try_dispatch_background_run(
 
     job_id = job["id"]
     job_name = str(job.get("name") or job_id)
+    from cron.executions import execution_is_blocked
 
     # Reap any execution row this job (or any job) left stranded 'claimed'/
     # 'running' by a dead owner process -- e.g. a PRIOR one-shot `hermes
@@ -1273,8 +1382,10 @@ def _try_dispatch_background_run(
     # is left untouched.
     try:
         from cron.executions import recover_interrupted_executions
+        from governance import recover_open_routes
 
         _reclaimed = recover_interrupted_executions()
+        recover_open_routes()
         if _reclaimed:
             logger.warning(
                 "Reclaimed %d stale cron execution(s) from dead owner(s) "
@@ -1286,6 +1397,9 @@ def _try_dispatch_background_run(
         # Best-effort self-heal; a failure here must not block dispatch —
         # but stay diagnosable (mirrors the scheduler tick's reap handling).
         logger.debug("Stale execution reclaim failed: %s", _reap_exc)
+
+    if execution_is_blocked(job_id):
+        return _unknown_execution_refusal()
 
     # ---- routing capture (on THIS thread; contextvars don't cross the pool) ----
     # Resolved BEFORE the claim: with no routable session there is no durable
@@ -1309,6 +1423,7 @@ def _try_dispatch_background_run(
         return None
 
     # ---- synchronous claim (same semantics as _execute_job_now) ----
+    admitted = None
     try:
         # Best-effort early dedupe so a mid-run job reports in THIS tool
         # response instead of as a delayed error completion event. The
@@ -1329,6 +1444,12 @@ def _try_dispatch_background_run(
         except Exception:
             pass
 
+        # Admit BEFORE the claim (see _execute_job_now): a refusal from the
+        # atomic gate must not consume the fire claim or advance the schedule.
+        admitted = _admit_manual_attempt(job_id)
+        if admitted is None:
+            return _unknown_execution_refusal()
+
         # Same snapshot claim as _execute_job_now: carry the owner-bearing
         # record into the run so terminal writes stay fenced by this owner.
         claimed_job = claim_job_for_fire(job_id, return_job=True)
@@ -1340,9 +1461,15 @@ def _try_dispatch_background_run(
                 reason = "Job is paused/disabled; resume it before running."
             else:
                 reason = "Job is already being fired by the scheduler; not run again."
+            _terminalize_admitted_attempt(
+                admitted, f"Fire claim was not acquired: {reason}"
+            )
             return {"claimed": False, "success": False, "error": reason}
     except Exception as e:
         logger.error("Failed to claim cron job %s for background run: %s", job_id, e)
+        _terminalize_admitted_attempt(
+            admitted, f"Fire claim failed before dispatch: {type(e).__name__}: {e}"
+        )
         try:
             mark_job_run(job_id, False, str(e))
         except Exception:
@@ -1369,7 +1496,9 @@ def _try_dispatch_background_run(
             "cronjob run: async delegation registry unavailable (%s); "
             "running job '%s' inline.", e, job_name,
         )
-        result = _run_claimed_job(claimed_job, extra_prompt=extra_prompt)
+        result = _run_claimed_job(
+            claimed_job, extra_prompt=extra_prompt, admitted=admitted
+        )
         result["dispatched"] = False
         return result
 
@@ -1391,7 +1520,9 @@ def _try_dispatch_background_run(
     deliver = _normalize_deliver_value(claimed_job.get("deliver", "local"))
 
     def _runner() -> Dict[str, Any]:
-        res = _run_claimed_job(claimed_job, extra_prompt=extra_prompt)
+        res = _run_claimed_job(
+            claimed_job, extra_prompt=extra_prompt, admitted=admitted
+        )
         duration = round(time.time() - started_at, 2)
         refreshed = get_job(job_id) or {}
         lines = [
@@ -1415,22 +1546,42 @@ def _try_dispatch_background_run(
             "duration_seconds": duration,
         }
 
-    dispatch = dispatch_async_delegation(
-        goal=f"Manual run of cron job '{job_name}' ({job_id})",
-        context=(
-            "Triggered via cronjob(action='run'). The job executed in its own "
-            "fresh cron session; this block reports its outcome."
-        ),
-        toolsets=None,
-        role="cron_run",
-        model=job.get("model"),
-        session_key=session_key,
-        parent_session_id=str(session_id) if session_id else None,
-        runner=_runner,
-        origin_ui_session_id=origin_ui_session_id,
-        origin_session_id=origin_session_id,
-        max_async_children=max_async,
-    )
+    try:
+        dispatch = dispatch_async_delegation(
+            goal=f"Manual run of cron job '{job_name}' ({job_id})",
+            context=(
+                "Triggered via cronjob(action='run'). The job executed in its own "
+                "fresh cron session; this block reports its outcome."
+            ),
+            toolsets=None,
+            role="cron_run",
+            model=job.get("model"),
+            session_key=session_key,
+            parent_session_id=str(session_id) if session_id else None,
+            runner=_runner,
+            origin_ui_session_id=origin_ui_session_id,
+            origin_session_id=origin_session_id,
+            max_async_children=max_async,
+        )
+    except Exception as dispatch_exc:
+        # The dispatcher can raise after it has already submitted the runner,
+        # so running inline here could fire the job twice.  Fail closed: give
+        # the admitted attempt a terminal state (a runner that starts late
+        # loses the claimed->running CAS and does nothing) and report the
+        # failure.  The fire claim is deliberately left in place: a runner
+        # that already started may still be executing, and the claim's TTL
+        # is what refuses a cross-process retry until it is over.
+        _dispatch_error = (
+            f"Background dispatch failed: {type(dispatch_exc).__name__}: {dispatch_exc}"
+        )
+        logger.error("cronjob run: %s (job '%s')", _dispatch_error, job_name)
+        _terminalize_admitted_attempt(admitted, _dispatch_error)
+        return {
+            "claimed": True,
+            "dispatched": False,
+            "success": False,
+            "error": _dispatch_error,
+        }
 
     if dispatch.get("status") == "dispatched":
         return {
@@ -1440,12 +1591,15 @@ def _try_dispatch_background_run(
         }
 
     # Pool at capacity (or submit failure): the claim is already taken and
-    # must not be stranded — run inline exactly as the legacy path did.
+    # must not be stranded — run inline exactly as the legacy path did, on
+    # the owner-bearing claimed snapshot so terminal writes stay fenced.
     logger.info(
         "cronjob run: background pool unavailable (%s); running job '%s' inline.",
         dispatch.get("error", "rejected"), job_name,
     )
-    result = _run_claimed_job(job, extra_prompt=extra_prompt)
+    result = _run_claimed_job(
+        claimed_job, extra_prompt=extra_prompt, admitted=admitted
+    )
     result["dispatched"] = False
     return result
 

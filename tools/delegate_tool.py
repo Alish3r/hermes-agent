@@ -36,6 +36,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 from toolsets import TOOLSETS
 from agent.interrupt_compat import request_hard_interrupt
+from governance import finish_route, route_allowed, route_pair, start_route
 
 # Sentinel value used by the runtime provider system for providers that are
 # not natively known (named custom providers, third-party aggregators, etc.).
@@ -953,6 +954,32 @@ def _get_worktree_isolation() -> bool:
     """
     cfg = _load_config()
     return bool(cfg.get("worktree_isolation", False))
+
+
+def _get_route_allow_list() -> Optional[List[Any]]:
+    """Return the active executor policy, never child-derived state.
+
+    ``delegation.route_allow_list`` is an optional list of ``provider:model``
+    strings or two-item provider/model pairs.  An absent key preserves the
+    historical allow-by-default behavior.  A malformed configured value fails
+    closed rather than letting a child silently choose its own authorization.
+    """
+    value = _load_config().get("route_allow_list")
+    if value is None:
+        return None
+    if isinstance(value, (list, tuple)):
+        return list(value)
+    logger.error("delegation.route_allow_list must be a list; refusing delegated routes")
+    return []
+
+
+def _public_route(record: Dict[str, Any]) -> Dict[str, Any]:
+    """Route facts for the parent-visible entry; the ledger key stays in the ledger.
+
+    Two runs of the same child must yield byte-identical result entries (a
+    pinned contract), so the per-run ``route_id`` is never copied out.
+    """
+    return {key: value for key, value in record.items() if key != "route_id"}
 
 
 _LEGACY_MAX_ASYNC_WARNED = False
@@ -2837,6 +2864,74 @@ def _run_single_child(
             }
         )
 
+    # Executor-owned route governance starts before the child gets a run slot.
+    # Provider/model come from resolved child attributes, never task content.
+    _route_record: Optional[Dict[str, Any]] = None
+    _route_terminal = False
+    _route_allow_list = _get_route_allow_list()
+    try:
+        _route_record = start_route(
+            getattr(child, "provider", None),
+            getattr(child, "model", None),
+            allow_list=_route_allow_list,
+        )
+    except Exception as _route_exc:
+        _failed_provider, _failed_model = route_pair(
+            getattr(child, "provider", None), getattr(child, "model", None)
+        )
+        _route_record = {"route_id": None, "provider": _failed_provider,
+                         "model": _failed_model,
+                         "status": "failed", "durable": False,
+                         "route_persistence_error": str(_route_exc)}
+    if _route_allow_list is not None and _route_record.get("status") == "start":
+        # Fallback activation rewrites the child's provider/model mid-run with
+        # no further governance check, so the policy must be applied to the
+        # inherited chain now: a governed child can only fall back onto routes
+        # the same allow-list admits.
+        _chain = getattr(child, "_fallback_chain", None)
+        if _chain:
+            child._fallback_chain = [
+                _fb for _fb in _chain
+                if isinstance(_fb, dict)
+                and route_allowed(_fb.get("provider"), _fb.get("model"), allow_list=_route_allow_list)
+            ]
+
+    def _final_route() -> tuple:
+        return route_pair(getattr(child, "provider", None), getattr(child, "model", None))
+
+    def _finish_governed(entry: Dict[str, Any], status: str, error: Optional[str] = None) -> Dict[str, Any]:
+        """Attach route facts without claiming a terminal write that failed."""
+        nonlocal _route_terminal
+        if _route_record is not None:
+            entry["route"] = _public_route(_route_record)
+            if _route_record.get("status") == "refused":
+                _route_terminal = True
+                return entry
+            route_id = _route_record.get("route_id")
+            if route_id and not _route_terminal:
+                # A terminal result has been assembled at this point.  Even if
+                # its durable write fails, cleanup must not rewrite the route
+                # to a different terminal status (for example interrupted).
+                _route_terminal = True
+                _provider, _model = _final_route()
+                try:
+                    terminal = finish_route(
+                        route_id, status, error=error, provider=_provider, model=_model
+                    )
+                    entry["route"].update(_public_route(terminal))
+                except Exception as exc:
+                    # The child outcome is still known even when persisting it
+                    # failed. Return that attempted terminal status truthfully
+                    # while making the missing durable receipt explicit.
+                    entry["route"].update({"status": status, "error": error,
+                                           "provider": _provider, "model": _model})
+                    entry["route"]["durable"] = False
+                    entry["route"]["route_persistence_error"] = str(exc)
+                    entry["route"]["terminal_persisted"] = False
+        return entry
+
+    _route_blocked = _route_record is None or _route_record.get("status") in {"failed", "refused"}
+
     # Worktree-isolation state: populated inside the try once the child's
     # task id is known; the default no-op keeps every early error path safe.
     _worktree_info: Optional[Dict[str, str]] = None
@@ -2883,6 +2978,20 @@ def _run_single_child(
                 }
 
     try:
+        if _route_blocked:
+            _refused_error = (
+                "Route governance could not record the child start."
+                if _route_record is None or _route_record.get("status") == "failed"
+                else str(_route_record.get("error") or "Route refused.")
+            )
+            return _finish_governed(
+                {"task_index": task_index, "status": "failed", "summary": None,
+                 "error": _refused_error, "api_calls": 0,
+                 "duration_seconds": 0, "exit_reason": "error"},
+                "failed" if _route_record.get("status") != "refused" else "refused",
+                _refused_error,
+            )
+
         from agent.periodic_scheduler import schedule as _schedule_periodic
 
         _heartbeat_handle[0] = _schedule_periodic(_heartbeat_tick, _HEARTBEAT_INTERVAL)
@@ -3190,7 +3299,14 @@ def _run_single_child(
                     _resweep_timer = threading.Timer(5.0, _drain_resweep)
                     _resweep_timer.daemon = True
                     _resweep_timer.start()
-            return _error_entry
+            # A worker that is still running past the deadline may keep
+            # producing side effects; the executor cannot claim the child
+            # finished, so the ledger records unknown rather than interrupted.
+            if is_timeout:
+                _timeout_status = "unknown" if not _child_future.done() else "interrupted"
+            else:
+                _timeout_status = "failed"
+            return _finish_governed(_error_entry, _timeout_status, _err)
         finally:
             # Shut down executor without waiting — if the child thread
             # is stuck on blocking I/O, wait=True would hang forever.
@@ -3580,7 +3696,7 @@ def _run_single_child(
                 logger.debug("Progress callback completion failed: %s", e)
 
         _attach_worktree(entry)
-        return entry
+        return _finish_governed(entry, "interrupted" if interrupted else ("failed" if status == "failed" else "completed"), entry.get("error"))
 
     except Exception as exc:
         _late_pending_steer = (
@@ -3616,9 +3732,19 @@ def _run_single_child(
             )
         # _attach_worktree defaults to a no-op when isolation never engaged.
         _attach_worktree(_error_entry)
-        return _error_entry
+        return _finish_governed(_error_entry, "failed", str(exc))
 
     finally:
+        if _route_record and _route_record.get("route_id") and not _route_terminal:
+            try:
+                finish_route(
+                    _route_record["route_id"],
+                    "interrupted",
+                    error="Child exited before a durable terminal result was assembled.",
+                )
+            except Exception:
+                logger.debug("Could not recover open delegated route", exc_info=True)
+
         # Stop the heartbeat so it doesn't keep touching parent activity
         # after the child has finished (or failed).  The handle is None if
         # scheduling itself raised (OS thread exhaustion on first use).
